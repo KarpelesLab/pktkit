@@ -45,8 +45,7 @@ func TestDHCPServerIntegration(t *testing.T) {
 	defer stack.Close()
 	stack.SetAddr(netip.MustParsePrefix("192.168.0.1/24"))
 
-	slirpMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
-	slirpAdapter := pktkit.NewL2Adapter(stack, slirpMAC)
+	slirpAdapter := pktkit.NewL2Adapter(stack, nil)
 	hub.Connect(slirpAdapter)
 
 	// --- virtual client ---
@@ -57,8 +56,7 @@ func TestDHCPServerIntegration(t *testing.T) {
 	client.SetIP(net.IPv4zero, net.CIDRMask(0, 32), net.IPv4(192, 168, 0, 1))
 	client.SetDNS([]net.IP{net.IPv4(1, 1, 1, 1), net.IPv4(8, 8, 8, 8)})
 
-	clientMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}
-	clientAdapter := pktkit.NewL2Adapter(client, clientMAC)
+	clientAdapter := pktkit.NewL2Adapter(client, nil)
 	hub.Connect(clientAdapter)
 
 	// --- Start DHCP on the client adapter ---

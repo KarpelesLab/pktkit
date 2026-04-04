@@ -1,6 +1,7 @@
 package pktkit
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"net"
 	"net/netip"
@@ -17,7 +18,7 @@ const defaultFrameBufSize = 1536 // 14-byte header + 1522-byte payload
 // Usage:
 //
 //	l3dev := NewPipeL3(netip.MustParsePrefix("10.0.0.2/24"))
-//	adapter := NewL2Adapter(l3dev, mac)
+//	adapter := NewL2Adapter(l3dev, nil) // random MAC
 //	hub.Connect(adapter) // adapter implements L2Device
 type L2Adapter struct {
 	mac   net.HardwareAddr
@@ -35,10 +36,16 @@ type L2Adapter struct {
 	framePool sync.Pool
 }
 
-// NewL2Adapter creates an adapter that wraps the given L3Device with the
-// given MAC address. It wires itself as the L3Device's handler so that
-// outgoing packets are automatically framed and sent on the L2 network.
+// NewL2Adapter creates an adapter that wraps the given L3Device. If mac is
+// nil, a random locally-administered unicast MAC address is generated.
+// It wires itself as the L3Device's handler so that outgoing packets are
+// automatically framed and sent on the L2 network.
 func NewL2Adapter(dev L3Device, mac net.HardwareAddr) *L2Adapter {
+	if mac == nil {
+		mac = make(net.HardwareAddr, 6)
+		rand.Read(mac)
+		mac[0] = mac[0]&0xFE | 0x02 // locally administered, unicast
+	}
 	a := &L2Adapter{
 		mac:     mac,
 		l3dev:   dev,

@@ -72,13 +72,13 @@ hub.Connect(dhcpSrv)
 // NAT gateway (slirp routes to real internet)
 stack := slirp.New()
 stack.SetAddr(netip.MustParsePrefix("192.168.0.1/24"))
-hub.Connect(pktkit.NewL2Adapter(stack, net.HardwareAddr{0x02, 0, 0, 0, 0, 1}))
+hub.Connect(pktkit.NewL2Adapter(stack, nil))
 
 // Virtual client — gets IP via DHCP, can dial out
 client := vclient.New()
 client.SetIP(net.IPv4zero, net.CIDRMask(0, 32), net.IPv4(192, 168, 0, 1))
 client.SetDNS([]net.IP{net.IPv4(1, 1, 1, 1)})
-adapter := pktkit.NewL2Adapter(client, net.HardwareAddr{0x02, 0, 0, 0, 0, 2})
+adapter := pktkit.NewL2Adapter(client, nil)
 hub.Connect(adapter)
 adapter.StartDHCP()
 
