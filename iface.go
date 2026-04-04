@@ -11,7 +11,7 @@ import (
 // Send may be called from any goroutine. The Frame passed to the handler is
 // only valid for the duration of the callback.
 type L2Device interface {
-	SetHandler(func(Frame))
+	SetHandler(func(Frame) error)
 	Send(Frame) error
 	HWAddr() net.HardwareAddr
 	Close() error
@@ -26,7 +26,7 @@ type L2Device interface {
 // Addr returns the device's current IP prefix. SetAddr updates it (e.g. from
 // DHCP). Implementations should store the prefix atomically.
 type L3Device interface {
-	SetHandler(func(Packet))
+	SetHandler(func(Packet) error)
 	Send(Packet) error
 	Addr() netip.Prefix
 	SetAddr(netip.Prefix) error

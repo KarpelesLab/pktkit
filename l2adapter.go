@@ -24,7 +24,7 @@ type L2Adapter struct {
 	l3dev L3Device
 
 	// Handler set by the L2 network (e.g. hub) to receive frames from us.
-	l2handler atomic.Pointer[func(Frame)]
+	l2handler atomic.Pointer[func(Frame) error]
 
 	arp     *arpTable
 	pending *arpPending
@@ -52,8 +52,9 @@ func NewL2Adapter(dev L3Device, mac net.HardwareAddr) *L2Adapter {
 	a.dhcp = newDHCPClient(a)
 
 	// When the L3 device produces a packet, wrap it in Ethernet and send.
-	dev.SetHandler(func(pkt Packet) {
+	dev.SetHandler(func(pkt Packet) error {
 		a.handleOutgoingL3Packet(pkt)
+		return nil
 	})
 
 	return a
@@ -63,7 +64,7 @@ func NewL2Adapter(dev L3Device, mac net.HardwareAddr) *L2Adapter {
 
 // SetHandler is called by the L2 network (e.g. an L2Hub) to receive frames
 // produced by this adapter.
-func (a *L2Adapter) SetHandler(h func(Frame)) {
+func (a *L2Adapter) SetHandler(h func(Frame) error) {
 	a.l2handler.Store(&h)
 }
 

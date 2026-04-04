@@ -40,8 +40,9 @@ func (h *L3Hub) Connect(dev L3Device) *L3HubHandle {
 	h.ports.Store(newPorts)
 	h.mu.Unlock()
 
-	dev.SetHandler(func(pkt Packet) {
+	dev.SetHandler(func(pkt Packet) error {
 		h.route(pkt, id)
+		return nil
 	})
 
 	return handle

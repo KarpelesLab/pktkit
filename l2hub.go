@@ -46,8 +46,9 @@ func (h *L2Hub) Connect(dev L2Device) *L2HubHandle {
 	h.ports.Store(newPorts)
 	h.mu.Unlock()
 
-	dev.SetHandler(func(f Frame) {
+	dev.SetHandler(func(f Frame) error {
 		h.broadcast(f, id)
+		return nil
 	})
 
 	return handle
