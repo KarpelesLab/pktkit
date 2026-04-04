@@ -195,13 +195,19 @@ func (n *NAT) matchForward(proto uint8, outsidePort uint16) *PortForward {
 
 // helperOutbound runs all matching packet helpers on an outbound packet.
 func (n *NAT) helperOutbound(pkt pktkit.Packet, m *natMapping, proto uint8, dstPort uint16) pktkit.Packet {
+	n.mu.Lock()
+	helpers := n.helpers
+	n.mu.Unlock()
+	if len(helpers) == 0 {
+		return pkt
+	}
 	nm := &NATMapping{
 		Proto:       m.key.proto,
 		InsideIP:    m.key.ip,
 		InsidePort:  m.key.port,
 		OutsidePort: m.outsidePort,
 	}
-	for _, h := range n.helpers {
+	for _, h := range helpers {
 		ph, ok := h.(PacketHelper)
 		if !ok {
 			continue
@@ -215,13 +221,19 @@ func (n *NAT) helperOutbound(pkt pktkit.Packet, m *natMapping, proto uint8, dstP
 
 // helperInbound runs all matching packet helpers on an inbound packet.
 func (n *NAT) helperInbound(pkt pktkit.Packet, m *natMapping, proto uint8, dstPort uint16) pktkit.Packet {
+	n.mu.Lock()
+	helpers := n.helpers
+	n.mu.Unlock()
+	if len(helpers) == 0 {
+		return pkt
+	}
 	nm := &NATMapping{
 		Proto:       m.key.proto,
 		InsideIP:    m.key.ip,
 		InsidePort:  m.key.port,
 		OutsidePort: m.outsidePort,
 	}
-	for _, h := range n.helpers {
+	for _, h := range helpers {
 		ph, ok := h.(PacketHelper)
 		if !ok {
 			continue
@@ -235,7 +247,10 @@ func (n *NAT) helperInbound(pkt pktkit.Packet, m *natMapping, proto uint8, dstPo
 
 // handleLocal checks if any local helper consumes the packet.
 func (n *NAT) handleLocal(pkt pktkit.Packet) bool {
-	for _, h := range n.helpers {
+	n.mu.Lock()
+	helpers := n.helpers
+	n.mu.Unlock()
+	for _, h := range helpers {
 		lh, ok := h.(LocalHelper)
 		if !ok {
 			continue
