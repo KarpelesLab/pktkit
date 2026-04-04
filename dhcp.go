@@ -61,9 +61,9 @@ func newDHCPClient(a *L2Adapter) *dhcpClient {
 // Start begins the DHCP discovery process.
 func (d *dhcpClient) Start() {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.xid = rand.Uint32()
 	d.state = dhcpSelecting
+	d.mu.Unlock()
 	d.sendDiscover()
 }
 
@@ -90,10 +90,11 @@ func (d *dhcpClient) HandlePacket(udpPayload []byte) {
 	}
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	// Lock is released before sending to avoid deadlock with synchronous callbacks.
 
 	xid := binary.BigEndian.Uint32(udpPayload[4:8])
 	if xid != d.xid {
+		d.mu.Unlock()
 		return
 	}
 
@@ -102,16 +103,19 @@ func (d *dhcpClient) HandlePacket(udpPayload []byte) {
 
 	// Parse options (start at offset 240, after magic cookie)
 	if len(udpPayload) < 244 {
+		d.mu.Unlock()
 		return
 	}
 	// Verify magic cookie
 	if udpPayload[236] != 99 || udpPayload[237] != 130 || udpPayload[238] != 83 || udpPayload[239] != 99 {
+		d.mu.Unlock()
 		return
 	}
 
 	var msgType byte
 	var subnetMask netip.Addr
 	var serverID netip.Addr
+	var router netip.Addr
 	var leaseTime uint32
 
 	opts := udpPayload[240:]
@@ -146,6 +150,10 @@ func (d *dhcpClient) HandlePacket(udpPayload []byte) {
 			if length == 4 {
 				serverID = netip.AddrFrom4([4]byte(data[:4]))
 			}
+		case dhcpOptRouter:
+			if length >= 4 {
+				router = netip.AddrFrom4([4]byte(data[:4]))
+			}
 		case dhcpOptLeaseTime:
 			if length == 4 {
 				leaseTime = binary.BigEndian.Uint32(data[:4])
@@ -155,47 +163,58 @@ func (d *dhcpClient) HandlePacket(udpPayload []byte) {
 		opts = opts[2+length:]
 	}
 
+	// Determine action under lock, then release before sending.
+	var action int // 0=none, 1=sendRequest, 2=sendDiscover
 	switch d.state {
 	case dhcpSelecting:
 		if msgType == dhcpOffer {
 			d.offeredIP = yiaddr
 			d.serverIP = serverID
 			d.state = dhcpRequesting
-			d.sendRequest()
+			action = 1
 		}
 
 	case dhcpRequesting, dhcpRenewing:
 		switch msgType {
 		case dhcpAck:
-			// Compute prefix length from subnet mask
-			bits := 24 // default /24
+			bits := 24
 			if subnetMask.IsValid() {
 				m := subnetMask.As4()
 				bits = maskBits(m)
 			}
 			prefix := netip.PrefixFrom(yiaddr, bits)
 			d.adapter.l3dev.SetAddr(prefix)
+			if router.IsValid() {
+				d.adapter.SetGateway(router)
+			}
 			d.state = dhcpBound
 			if leaseTime > 0 {
 				d.leaseTime = time.Duration(leaseTime) * time.Second
-				// Schedule renewal at T1 (50% of lease)
 				if d.timer != nil {
 					d.timer.Stop()
 				}
 				d.timer = time.AfterFunc(d.leaseTime/2, func() {
 					d.mu.Lock()
-					defer d.mu.Unlock()
 					if d.state == dhcpBound {
 						d.state = dhcpRenewing
-						d.sendRequest()
 					}
+					d.mu.Unlock()
+					d.sendRequest()
 				})
 			}
 		case dhcpNak:
 			d.state = dhcpSelecting
 			d.xid = rand.Uint32()
-			d.sendDiscover()
+			action = 2
 		}
+	}
+	d.mu.Unlock()
+
+	switch action {
+	case 1:
+		d.sendRequest()
+	case 2:
+		d.sendDiscover()
 	}
 }
 

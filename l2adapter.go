@@ -26,6 +26,8 @@ type L2Adapter struct {
 	// Handler set by the L2 network (e.g. hub) to receive frames from us.
 	l2handler atomic.Pointer[func(Frame) error]
 
+	gateway atomic.Value // netip.Addr — next-hop for off-subnet destinations
+
 	arp     *arpTable
 	pending *arpPending
 	dhcp    *dhcpClient
@@ -84,6 +86,13 @@ func (a *L2Adapter) HWAddr() net.HardwareAddr {
 func (a *L2Adapter) Close() error {
 	a.dhcp.Stop()
 	return nil
+}
+
+// SetGateway sets the default gateway for off-subnet routing.
+// When sending to an IP not covered by the L3 device's prefix, the adapter
+// will ARP for the gateway MAC instead of the destination IP directly.
+func (a *L2Adapter) SetGateway(gw netip.Addr) {
+	a.gateway.Store(gw)
 }
 
 // --- DHCP controls ---
@@ -171,12 +180,19 @@ func (a *L2Adapter) handleOutgoingL3Packet(pkt Packet) {
 			dst := pkt.IPv4DstAddr().As4()
 			dstMAC = net.HardwareAddr{0x01, 0x00, 0x5E, dst[1] & 0x7F, dst[2], dst[3]}
 		} else {
-			dstIP := pkt.IPv4DstAddr()
-			mac, ok := a.arp.Lookup(dstIP)
+			// Determine ARP target: use gateway for off-subnet destinations.
+			arpTarget := pkt.IPv4DstAddr()
+			prefix := a.l3dev.Addr()
+			if prefix.IsValid() && !prefix.Contains(arpTarget) {
+				if gw, ok := a.gateway.Load().(netip.Addr); ok && gw.IsValid() {
+					arpTarget = gw
+				}
+			}
+			mac, ok := a.arp.Lookup(arpTarget)
 			if !ok {
-				sendReq := a.pending.Enqueue(dstIP, pkt)
+				sendReq := a.pending.Enqueue(arpTarget, pkt)
 				if sendReq {
-					a.sendARPRequest(dstIP)
+					a.sendARPRequest(arpTarget)
 				}
 				return
 			}
