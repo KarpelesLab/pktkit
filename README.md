@@ -1,5 +1,10 @@
 # pktkit
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/KarpelesLab/pktkit.svg)](https://pkg.go.dev/github.com/KarpelesLab/pktkit)
+[![Test](https://github.com/KarpelesLab/pktkit/actions/workflows/test.yml/badge.svg)](https://github.com/KarpelesLab/pktkit/actions/workflows/test.yml)
+[![Coverage Status](https://coveralls.io/repos/github/KarpelesLab/pktkit/badge.svg?branch=master)](https://coveralls.io/github/KarpelesLab/pktkit?branch=master)
+[![Go Report Card](https://goreportcard.com/badge/github.com/KarpelesLab/pktkit)](https://goreportcard.com/report/github.com/KarpelesLab/pktkit)
+
 Zero-copy L2/L3 packet handling library for Go.
 
 pktkit provides primitives for building virtual network topologies: devices, hubs, and adapters that move Ethernet frames and IP packets without copying buffers on the hot path.
