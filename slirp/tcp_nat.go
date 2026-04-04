@@ -2,7 +2,6 @@ package slirp
 
 import (
 	"io"
-	"log"
 	"net"
 	"sync"
 
@@ -24,26 +23,21 @@ type tcpNATConn struct {
 func (n *tcpNATConn) startBridge() {
 	// Remote → Client: read from real server, write to vtcp.Conn (which sends to client)
 	go func() {
-		_, err := io.Copy(n.vc, n.remote)
-		if err != nil {
-			log.Printf("usernat tcp bridge remote→client: %v", err)
-		}
+		io.Copy(n.vc, n.remote)
 		// Remote closed or errored — close the vtcp.Conn (sends FIN to client)
 		n.vc.Close()
 	}()
 
 	// Client → Remote: read from vtcp.Conn (data from client), write to real server
 	go func() {
-		_, err := io.Copy(n.remote, n.vc)
-		if err != nil && err != io.EOF {
-			log.Printf("usernat tcp bridge client→remote: %v", err)
-		}
+		io.Copy(n.remote, n.vc)
 		// Client closed or errored — half-close the real connection
 		if tc, ok := n.remote.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
 	}()
 }
+
 
 // close shuts down both connections. Safe to call from multiple goroutines.
 func (n *tcpNATConn) close() {
