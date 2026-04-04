@@ -18,10 +18,24 @@ func (c *Client) LookupHost(ctx context.Context, host string) ([]string, error) 
 	}
 
 	c.mu.RLock()
-	if len(c.dns) == 0 {
-		c.mu.RUnlock()
+	hasDNS4 := len(c.dns) > 0
+	hasDNS6 := len(c.dns6) > 0
+	hasIP4 := c.ip != [4]byte{}
+	c.mu.RUnlock()
+
+	// Prefer IPv6 DNS when no IPv4 is available, or when only IPv6 DNS is configured
+	if hasDNS6 && (!hasIP4 || !hasDNS4) {
+		return c.lookupHostIPv6(ctx, host)
+	}
+
+	if !hasDNS4 {
+		if hasDNS6 {
+			return c.lookupHostIPv6(ctx, host)
+		}
 		return nil, errors.New("no DNS servers configured")
 	}
+
+	c.mu.RLock()
 	dnsServer := c.dns[0]
 	localIP := c.ip
 	c.mu.RUnlock()
@@ -89,6 +103,80 @@ func (c *Client) LookupHost(ctx context.Context, host string) ([]string, error) 
 	}
 }
 
+// lookupHostIPv6 resolves a hostname using IPv6 DNS servers.
+func (c *Client) lookupHostIPv6(ctx context.Context, host string) ([]string, error) {
+	c.mu.RLock()
+	if len(c.dns6) == 0 {
+		c.mu.RUnlock()
+		return nil, errors.New("no IPv6 DNS servers configured")
+	}
+	dnsServer := c.dns6[0]
+	localIP := c.ip6
+	c.mu.RUnlock()
+
+	// Allocate ephemeral port and create IPv6 UDP conn for DNS
+	port := c.allocPort()
+	conn := newUDPConn6(c, localIP, port, dnsServer, 53)
+	c.udpMu.Lock()
+	c.udpConns6[connKey6{localPort: port, remoteIP: dnsServer, remotePort: 53}] = conn
+	c.udpMu.Unlock()
+	defer conn.Close()
+
+	// Build DNS query
+	id := uint16(rand.Uint32())
+	query := buildDNSQuery(id, host, 1) // A record
+
+	// Send query
+	if _, err := conn.Write(query); err != nil {
+		return nil, err
+	}
+
+	// Read responses in a goroutine so we can respect context/timeout
+	type dnsResult struct {
+		addrs []string
+		err   error
+	}
+	resultCh := make(chan dnsResult, 1)
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				resultCh <- dnsResult{err: err}
+				return
+			}
+			ips, err := parseDNSResponse(buf[:n], id)
+			if err != nil {
+				continue // wrong ID or parse error, keep waiting
+			}
+			if len(ips) == 0 {
+				resultCh <- dnsResult{err: errors.New("no addresses found for " + host)}
+				return
+			}
+			result := make([]string, len(ips))
+			for i, ip := range ips {
+				result[i] = ip.String()
+			}
+			resultCh <- dnsResult{addrs: result}
+			return
+		}
+	}()
+
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+
+	select {
+	case res := <-resultCh:
+		return res.addrs, res.err
+	case <-ctx.Done():
+		conn.Close() // unblock the Read goroutine
+		return nil, ctx.Err()
+	case <-timeout.C:
+		conn.Close() // unblock the Read goroutine
+		return nil, errors.New("DNS resolution timeout")
+	}
+}
+
 // Resolver returns a *net.Resolver that uses this client's DNS resolution.
 func (c *Client) Resolver() *net.Resolver {
 	return &net.Resolver{
@@ -96,10 +184,31 @@ func (c *Client) Resolver() *net.Resolver {
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			// Connect to our configured DNS server via UDP
 			c.mu.RLock()
-			if len(c.dns) == 0 {
+			hasDNS4 := len(c.dns) > 0
+			hasDNS6 := len(c.dns6) > 0
+			hasIP4 := c.ip != [4]byte{}
+			c.mu.RUnlock()
+
+			// Prefer IPv6 DNS when no IPv4 is available
+			if hasDNS6 && (!hasIP4 || !hasDNS4) {
+				c.mu.RLock()
+				dnsServer := c.dns6[0]
+				localIP := c.ip6
 				c.mu.RUnlock()
+
+				port := c.allocPort()
+				conn := newUDPConn6(c, localIP, port, dnsServer, 53)
+				c.udpMu.Lock()
+				c.udpConns6[connKey6{localPort: port, remoteIP: dnsServer, remotePort: 53}] = conn
+				c.udpMu.Unlock()
+				return conn, nil
+			}
+
+			if !hasDNS4 {
 				return nil, errors.New("no DNS servers configured")
 			}
+
+			c.mu.RLock()
 			dnsServer := c.dns[0]
 			localIP := c.ip
 			c.mu.RUnlock()

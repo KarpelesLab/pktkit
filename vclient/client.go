@@ -7,6 +7,7 @@
 package vclient
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -16,10 +17,17 @@ import (
 	"github.com/KarpelesLab/pktkit"
 )
 
-// connKey identifies a connection by local port + remote endpoint.
+// connKey identifies a connection by local port + remote endpoint (IPv4).
 type connKey struct {
 	localPort  uint16
 	remoteIP   [4]byte
+	remotePort uint16
+}
+
+// connKey6 identifies a connection by local port + remote endpoint (IPv6).
+type connKey6 struct {
+	localPort  uint16
+	remoteIP   [16]byte
 	remotePort uint16
 }
 
@@ -28,22 +36,31 @@ type connKey struct {
 type Client struct {
 	mu      sync.RWMutex
 	ip      [4]byte
+	ip6     [16]byte
 	mask    [4]byte
 	gw      [4]byte
 	dns     [][4]byte
+	dns6    [][16]byte
+	addr6   netip.Prefix // IPv6 prefix for L3 routing
 	handler atomic.Pointer[func(pktkit.Packet) error]
 
-	// TCP connections
+	// TCP connections (IPv4)
 	tcpMu    sync.Mutex
 	tcpConns map[connKey]*TCPConn
+
+	// TCP connections (IPv6)
+	tcpConns6 map[connKey6]*TCPConn
 
 	// TCP listeners
 	listenerMu sync.Mutex
 	listeners  map[uint16]*Listener // keyed by local port
 
-	// UDP connections
+	// UDP connections (IPv4)
 	udpMu    sync.Mutex
 	udpConns map[connKey]*UDPConn
+
+	// UDP connections (IPv6)
+	udpConns6 map[connKey6]*UDPConn6
 
 	// Ephemeral port allocation
 	portMu   sync.Mutex
@@ -58,8 +75,10 @@ type Client struct {
 func New() *Client {
 	return &Client{
 		tcpConns:  make(map[connKey]*TCPConn),
+		tcpConns6: make(map[connKey6]*TCPConn),
 		listeners: make(map[uint16]*Listener),
 		udpConns:  make(map[connKey]*UDPConn),
+		udpConns6: make(map[connKey6]*UDPConn6),
 		nextPort:  49152,
 		done:      make(chan struct{}),
 	}
@@ -81,11 +100,12 @@ func (c *Client) Send(pkt pktkit.Packet) error {
 // Implements [pktkit.L3Device].
 func (c *Client) Addr() netip.Prefix {
 	c.mu.RLock()
-	ip := c.ip
-	mask := c.mask
-	c.mu.RUnlock()
-	addr := netip.AddrFrom4(ip)
-	ones, _ := net.IPMask(mask[:]).Size()
+	defer c.mu.RUnlock()
+	if c.addr6.IsValid() {
+		return c.addr6
+	}
+	addr := netip.AddrFrom4(c.ip)
+	ones, _ := net.IPMask(c.mask[:]).Size()
 	return netip.PrefixFrom(addr, ones)
 }
 
@@ -94,6 +114,11 @@ func (c *Client) Addr() netip.Prefix {
 func (c *Client) SetAddr(p netip.Prefix) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if p.Addr().Is6() && !p.Addr().Is4In6() {
+		c.addr6 = p
+		c.ip6 = p.Addr().As16()
+		return nil
+	}
 	c.ip = p.Addr().As4()
 	m := net.CIDRMask(p.Bits(), 32)
 	copy(c.mask[:], m)
@@ -109,7 +134,14 @@ func (c *Client) SetIP(ip net.IP, mask net.IPMask, gw net.IP) {
 	copy(c.gw[:], gw.To4())
 }
 
-// SetDNS configures the DNS server addresses.
+// SetIPv6 configures the client's IPv6 address.
+func (c *Client) SetIPv6(ip net.IP) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	copy(c.ip6[:], ip.To16())
+}
+
+// SetDNS configures the DNS server addresses (IPv4).
 func (c *Client) SetDNS(servers []net.IP) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -118,6 +150,18 @@ func (c *Client) SetDNS(servers []net.IP) {
 		var ip [4]byte
 		copy(ip[:], s.To4())
 		c.dns = append(c.dns, ip)
+	}
+}
+
+// SetDNS6 configures the IPv6 DNS server addresses.
+func (c *Client) SetDNS6(servers []net.IP) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dns6 = nil
+	for _, s := range servers {
+		var ip [16]byte
+		copy(ip[:], s.To16())
+		c.dns6 = append(c.dns6, ip)
 	}
 }
 
@@ -130,13 +174,50 @@ func (c *Client) IP() net.IP {
 
 // handlePacket processes an incoming IP packet.
 func (c *Client) handlePacket(packet []byte) error {
-	if len(packet) < 20 {
+	if len(packet) < 1 {
 		return nil
 	}
 	version := packet[0] >> 4
 	switch version {
 	case 4:
+		if len(packet) < 20 {
+			return nil
+		}
 		return c.handleIPv4(packet)
+	case 6:
+		if len(packet) < 40 {
+			return nil
+		}
+		return c.handleIPv6(packet)
+	}
+	return nil
+}
+
+// handleIPv6 processes an incoming IPv6 packet.
+func (c *Client) handleIPv6(ip []byte) error {
+	if len(ip) < 40 {
+		return nil
+	}
+
+	payloadLen := int(binary.BigEndian.Uint16(ip[4:6]))
+	if len(ip) < 40+payloadLen {
+		return nil
+	}
+	ip = ip[:40+payloadLen]
+
+	nextHeader := ip[6]
+
+	switch nextHeader {
+	case 6: // TCP
+		if payloadLen < 20 {
+			return nil
+		}
+		return c.handleTCP6(ip)
+	case 17: // UDP
+		if payloadLen < 8 {
+			return nil
+		}
+		return c.handleUDP6(ip)
 	}
 	return nil
 }
@@ -181,13 +262,21 @@ func (c *Client) allocPort() uint16 {
 		}
 		c.portMu.Unlock()
 
-		// Check if port is in use in TCP connections
+		// Check if port is in use in TCP connections (IPv4 + IPv6)
 		inUse := false
 		c.tcpMu.Lock()
 		for k := range c.tcpConns {
 			if k.localPort == p {
 				inUse = true
 				break
+			}
+		}
+		if !inUse {
+			for k := range c.tcpConns6 {
+				if k.localPort == p {
+					inUse = true
+					break
+				}
 			}
 		}
 		c.tcpMu.Unlock()
@@ -198,6 +287,14 @@ func (c *Client) allocPort() uint16 {
 				if k.localPort == p {
 					inUse = true
 					break
+				}
+			}
+			if !inUse {
+				for k := range c.udpConns6 {
+					if k.localPort == p {
+						inUse = true
+						break
+					}
 				}
 			}
 			c.udpMu.Unlock()
@@ -242,15 +339,20 @@ func (c *Client) Close() error {
 	}
 	c.listenerMu.Unlock()
 
-	// Close all TCP connections
+	// Close all TCP connections (IPv4)
 	c.tcpMu.Lock()
 	for k, conn := range c.tcpConns {
 		conn.abort()
 		delete(c.tcpConns, k)
 	}
+	// Close all TCP connections (IPv6)
+	for k, conn := range c.tcpConns6 {
+		conn.abort()
+		delete(c.tcpConns6, k)
+	}
 	c.tcpMu.Unlock()
 
-	// Close all UDP connections
+	// Close all UDP connections (IPv4)
 	c.udpMu.Lock()
 	for k, conn := range c.udpConns {
 		conn.closed.Store(true)
@@ -259,6 +361,15 @@ func (c *Client) Close() error {
 		conn.recvCond.Broadcast()
 		conn.recvMu.Unlock()
 		delete(c.udpConns, k)
+	}
+	// Close all UDP connections (IPv6)
+	for k, conn := range c.udpConns6 {
+		conn.closed.Store(true)
+		conn.recvMu.Lock()
+		conn.closedForRead = true
+		conn.recvCond.Broadcast()
+		conn.recvMu.Unlock()
+		delete(c.udpConns6, k)
 	}
 	c.udpMu.Unlock()
 

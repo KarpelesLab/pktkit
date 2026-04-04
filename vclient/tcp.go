@@ -13,9 +13,11 @@ import (
 // It wraps a vtcp.Conn and handles registration/unregistration
 // with the parent Client.
 type TCPConn struct {
-	vc *vtcp.Conn
-	c  *Client
-	k  connKey
+	vc  *vtcp.Conn
+	c   *Client
+	k   connKey
+	k6  connKey6
+	v6  bool // true when this connection uses IPv6
 }
 
 func (tc *TCPConn) Read(b []byte) (int, error)  { return tc.vc.Read(b) }
@@ -24,7 +26,11 @@ func (tc *TCPConn) Write(b []byte) (int, error) { return tc.vc.Write(b) }
 func (tc *TCPConn) Close() error {
 	err := tc.vc.Close()
 	tc.c.tcpMu.Lock()
-	delete(tc.c.tcpConns, tc.k)
+	if tc.v6 {
+		delete(tc.c.tcpConns6, tc.k6)
+	} else {
+		delete(tc.c.tcpConns, tc.k)
+	}
 	tc.c.tcpMu.Unlock()
 	return err
 }
@@ -128,6 +134,95 @@ func (c *Client) handleTCP(ip []byte, ihl int) error {
 	return nil
 }
 
+// handleTCP6 dispatches incoming IPv6 TCP segments to the appropriate connection.
+func (c *Client) handleTCP6(ip []byte) error {
+	tcp := ip[40:]
+	if len(tcp) < 20 {
+		return nil
+	}
+	srcPort := binary.BigEndian.Uint16(tcp[0:2])
+	dstPort := binary.BigEndian.Uint16(tcp[2:4])
+	var srcIP, dstIP [16]byte
+	copy(srcIP[:], ip[8:24])
+	copy(dstIP[:], ip[24:40])
+
+	k := connKey6{localPort: dstPort, remoteIP: srcIP, remotePort: srcPort}
+	c.tcpMu.Lock()
+	conn := c.tcpConns6[k]
+	c.tcpMu.Unlock()
+
+	if conn != nil {
+		seg, err := vtcp.ParseSegment(tcp)
+		if err != nil {
+			return nil
+		}
+		pkts := conn.vc.HandleSegment(seg)
+		for _, pkt := range pkts {
+			_ = conn.vc.Writer()(pkt)
+		}
+		return nil
+	}
+
+	// No existing connection — check for pure SYN to a listener
+	flags := tcp[13]
+	if flags&(vtcp.FlagSYN|vtcp.FlagACK) != vtcp.FlagSYN {
+		return nil // not a pure SYN, drop
+	}
+
+	c.listenerMu.Lock()
+	l := c.listeners[dstPort]
+	c.listenerMu.Unlock()
+	if l == nil {
+		return nil // no listener on this port
+	}
+
+	seg, err := vtcp.ParseSegment(tcp)
+	if err != nil {
+		return nil
+	}
+
+	// Create a new vtcp.Conn for this incoming IPv6 connection
+	localAddr := &net.TCPAddr{IP: net.IP(dstIP[:]), Port: int(dstPort)}
+	remoteAddr := &net.TCPAddr{IP: net.IP(srcIP[:]), Port: int(srcPort)}
+
+	vc := vtcp.NewConn(vtcp.ConnConfig{
+		LocalPort:  dstPort,
+		RemotePort: srcPort,
+		LocalAddr:  localAddr,
+		RemoteAddr: remoteAddr,
+		Writer: func(tcpSeg []byte) error {
+			return c.sendPacket(buildIPv6Packet(dstIP, srcIP, tcpSeg))
+		},
+		MSS:       1440,
+		Keepalive: true,
+	})
+
+	synAckPkts := vc.AcceptSYN(seg)
+	tc := &TCPConn{vc: vc, c: c, k6: k, v6: true}
+
+	c.tcpMu.Lock()
+	c.tcpConns6[k] = tc
+	c.tcpMu.Unlock()
+
+	// Send SYN-ACK
+	for _, pkt := range synAckPkts {
+		_ = vc.Writer()(pkt)
+	}
+
+	// Queue for Accept()
+	select {
+	case l.acceptCh <- tc:
+	default:
+		// Accept queue full — abort the connection and remove from map
+		tc.vc.Abort()
+		c.tcpMu.Lock()
+		delete(c.tcpConns6, k)
+		c.tcpMu.Unlock()
+	}
+
+	return nil
+}
+
 // buildIPv4Packet builds an IPv4 packet containing a raw TCP segment.
 func buildIPv4Packet(srcIP, dstIP [4]byte, tcpSeg []byte) []byte {
 	ipHdr := make([]byte, 20)
@@ -158,5 +253,30 @@ func buildIPv4Packet(srcIP, dstIP [4]byte, tcpSeg []byte) []byte {
 	pkt := make([]byte, len(ipHdr)+len(tcpCopy))
 	copy(pkt, ipHdr)
 	copy(pkt[len(ipHdr):], tcpCopy)
+	return pkt
+}
+
+// buildIPv6Packet builds an IPv6 packet containing a raw TCP segment.
+func buildIPv6Packet(srcIP, dstIP [16]byte, tcpSeg []byte) []byte {
+	ipHdr := make([]byte, 40)
+	ipHdr[0] = 0x60 // Version 6
+	binary.BigEndian.PutUint16(ipHdr[4:6], uint16(len(tcpSeg)))
+	ipHdr[6] = 6  // Next Header: TCP
+	ipHdr[7] = 64 // Hop Limit
+	copy(ipHdr[8:24], srcIP[:])
+	copy(ipHdr[24:40], dstIP[:])
+
+	// Compute TCP checksum with IPv6 pseudo-header
+	tcpCopy := make([]byte, len(tcpSeg))
+	copy(tcpCopy, tcpSeg)
+	if len(tcpCopy) >= 18 {
+		binary.BigEndian.PutUint16(tcpCopy[16:18], 0)
+		cs := slirp.IPv6Checksum(srcIP, dstIP, 6, uint32(len(tcpCopy)), tcpCopy)
+		binary.BigEndian.PutUint16(tcpCopy[16:18], cs)
+	}
+
+	pkt := make([]byte, 40+len(tcpCopy))
+	copy(pkt, ipHdr)
+	copy(pkt[40:], tcpCopy)
 	return pkt
 }

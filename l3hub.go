@@ -12,10 +12,12 @@ type l3Port struct {
 
 // L3Hub is a routing hub that forwards IP packets to the appropriate connected
 // device based on destination address prefix matching. Multicast and broadcast
-// packets are sent to all ports except the source.
+// packets are sent to all ports except the source. A default route can be set
+// for packets that don't match any connected prefix.
 type L3Hub struct {
-	ports atomic.Value // []l3Port
-	mu    sync.Mutex
+	ports        atomic.Value // []l3Port
+	mu           sync.Mutex
+	defaultRoute atomic.Pointer[uint64] // port ID for default route
 }
 
 // NewL3Hub creates a new L3 routing hub.
@@ -48,6 +50,19 @@ func (h *L3Hub) Connect(dev L3Device) *L3HubHandle {
 	return handle
 }
 
+// SetDefaultRoute configures dev as the default route for packets that don't
+// match any connected prefix.
+func (h *L3Hub) SetDefaultRoute(dev L3Device) {
+	ports := h.ports.Load().([]l3Port)
+	for i := range ports {
+		if ports[i].dev == dev {
+			id := ports[i].id
+			h.defaultRoute.Store(&id)
+			return
+		}
+	}
+}
+
 func (h *L3Hub) route(pkt Packet, sourceID uint64) {
 	if !pkt.IsValid() {
 		return
@@ -75,6 +90,16 @@ func (h *L3Hub) route(pkt Packet, sourceID uint64) {
 		if ports[i].id != sourceID && ports[i].dev.Addr().Contains(dst) {
 			ports[i].dev.Send(pkt)
 			return
+		}
+	}
+
+	// No prefix match — use default route if configured
+	if dr := h.defaultRoute.Load(); dr != nil {
+		for i := range ports {
+			if ports[i].id == *dr && ports[i].id != sourceID {
+				ports[i].dev.Send(pkt)
+				return
+			}
 		}
 	}
 }

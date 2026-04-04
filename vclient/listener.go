@@ -19,11 +19,11 @@ type Listener struct {
 }
 
 // Listen announces on the virtual network address and returns a net.Listener.
-// The network must be "tcp" or "tcp4". The address is "host:port" where host
-// is the client's virtual IP (or empty/"0.0.0.0" for any).
+// The network must be "tcp", "tcp4", or "tcp6". The address is "host:port" where
+// host is the client's virtual IP (or empty/"0.0.0.0"/"::" for any).
 func (c *Client) Listen(network, address string) (net.Listener, error) {
 	switch network {
-	case "tcp", "tcp4":
+	case "tcp", "tcp4", "tcp6":
 	default:
 		return nil, errors.New("unsupported network: " + network)
 	}
@@ -37,23 +37,23 @@ func (c *Client) Listen(network, address string) (net.Listener, error) {
 		return nil, errors.New("invalid port")
 	}
 
-	// Resolve the listen IP
-	var listenIP [4]byte
-	if host == "" || host == "0.0.0.0" {
+	// Determine the listen address based on network and host
+	var listenAddr net.IP
+	if host == "" || host == "0.0.0.0" || host == "::" {
 		// wildcard — use client's IP for the address
 		c.mu.RLock()
-		listenIP = c.ip
+		if network == "tcp6" || (host == "::" && network == "tcp") {
+			listenAddr = net.IP(c.ip6[:])
+		} else {
+			listenAddr = net.IP(c.ip[:]).To4()
+		}
 		c.mu.RUnlock()
 	} else {
 		ip := net.ParseIP(host)
 		if ip == nil {
 			return nil, errors.New("invalid listen address: " + host)
 		}
-		ip4 := ip.To4()
-		if ip4 == nil {
-			return nil, errors.New("IPv6 not supported")
-		}
-		copy(listenIP[:], ip4)
+		listenAddr = ip
 	}
 
 	c.listenerMu.Lock()
@@ -65,7 +65,7 @@ func (c *Client) Listen(network, address string) (net.Listener, error) {
 
 	l := &Listener{
 		c:        c,
-		addr:     &net.TCPAddr{IP: net.IP(listenIP[:]).To4(), Port: port},
+		addr:     &net.TCPAddr{IP: listenAddr, Port: port},
 		port:     uint16(port),
 		acceptCh: make(chan net.Conn, 16),
 		closeCh:  make(chan struct{}),
