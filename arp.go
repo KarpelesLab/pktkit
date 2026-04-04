@@ -12,8 +12,10 @@ const (
 	arpOpRequest = 1
 	arpOpReply   = 2
 
-	arpDefaultTTL     = 5 * time.Minute
-	arpPendingMaxPkts = 16
+	arpDefaultTTL      = 5 * time.Minute
+	arpPendingMaxPkts  = 16
+	arpPendingTimeout  = 3 * time.Second
+	arpCleanupInterval = 1 * time.Second
 )
 
 var broadcastMAC = net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
@@ -57,28 +59,43 @@ func (t *arpTable) Set(ip netip.Addr, mac net.HardwareAddr, ttl time.Duration) {
 	t.mu.Unlock()
 }
 
-// arpPending holds packets awaiting ARP resolution, bounded per IP.
+type pendingEntry struct {
+	pkts    []Packet
+	created time.Time
+}
+
+// arpPending holds packets awaiting ARP/NDP resolution, bounded per IP.
+// Entries older than arpPendingTimeout are dropped by a cleanup goroutine.
 type arpPending struct {
 	mu      sync.Mutex
-	entries map[netip.Addr][]Packet
+	entries map[netip.Addr]*pendingEntry
+	stop    chan struct{}
 }
 
 func newARPPending() *arpPending {
-	return &arpPending{entries: make(map[netip.Addr][]Packet)}
+	q := &arpPending{
+		entries: make(map[netip.Addr]*pendingEntry),
+		stop:    make(chan struct{}),
+	}
+	go q.cleanupLoop()
+	return q
 }
 
-// Enqueue stores a copy of pkt for the unresolved IP. Returns true if an ARP
-// request should be sent (i.e. this is the first pending packet for this IP).
+// Enqueue stores a copy of pkt for the unresolved IP. Returns true if a
+// solicitation should be sent (i.e. this is the first pending packet for this IP).
 func (q *arpPending) Enqueue(ip netip.Addr, pkt Packet) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	existing := q.entries[ip]
-	first := len(existing) == 0
-	if len(existing) < arpPendingMaxPkts {
-		// Copy the packet since the original buffer may be reused.
+	e := q.entries[ip]
+	first := e == nil
+	if first {
+		e = &pendingEntry{created: time.Now()}
+		q.entries[ip] = e
+	}
+	if len(e.pkts) < arpPendingMaxPkts {
 		cp := make(Packet, len(pkt))
 		copy(cp, pkt)
-		q.entries[ip] = append(existing, cp)
+		e.pkts = append(e.pkts, cp)
 	}
 	return first
 }
@@ -86,10 +103,42 @@ func (q *arpPending) Enqueue(ip netip.Addr, pkt Packet) bool {
 // Drain removes and returns all pending packets for the given IP.
 func (q *arpPending) Drain(ip netip.Addr) []Packet {
 	q.mu.Lock()
-	pkts := q.entries[ip]
+	e := q.entries[ip]
 	delete(q.entries, ip)
 	q.mu.Unlock()
-	return pkts
+	if e == nil {
+		return nil
+	}
+	return e.pkts
+}
+
+// Close stops the cleanup goroutine.
+func (q *arpPending) Close() {
+	select {
+	case <-q.stop:
+	default:
+		close(q.stop)
+	}
+}
+
+func (q *arpPending) cleanupLoop() {
+	ticker := time.NewTicker(arpCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-q.stop:
+			return
+		case <-ticker.C:
+		}
+		now := time.Now()
+		q.mu.Lock()
+		for ip, e := range q.entries {
+			if now.Sub(e.created) > arpPendingTimeout {
+				delete(q.entries, ip)
+			}
+		}
+		q.mu.Unlock()
+	}
 }
 
 // buildARPPacket constructs a 28-byte ARP payload for IPv4-over-Ethernet.

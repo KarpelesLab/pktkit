@@ -41,8 +41,9 @@ type DHCPServer struct {
 	mac     net.HardwareAddr
 	handler atomic.Pointer[func(Frame) error]
 
-	mu     sync.Mutex
-	leases map[[6]byte]*dhcpLease // keyed by client MAC
+	mu       sync.Mutex
+	leases   map[[6]byte]*dhcpLease    // keyed by client MAC
+	declined map[netip.Addr]time.Time  // IPs declined by clients
 }
 
 // NewDHCPServer creates a new DHCP server with the given configuration.
@@ -55,9 +56,10 @@ func NewDHCPServer(cfg DHCPServerConfig) *DHCPServer {
 		mac = net.HardwareAddr{0x02, 0xDD, 0xCC, 0x00, 0x00, 0x01}
 	}
 	return &DHCPServer{
-		cfg:    cfg,
-		mac:    mac,
-		leases: make(map[[6]byte]*dhcpLease),
+		cfg:      cfg,
+		mac:      mac,
+		leases:   make(map[[6]byte]*dhcpLease),
+		declined: make(map[netip.Addr]time.Time),
 	}
 }
 
@@ -167,6 +169,13 @@ func (s *DHCPServer) handleDHCP(msg []byte) {
 			return
 		}
 		s.sendReply(dhcpAck, xid, chaddr, ip)
+	case 7: // RELEASE
+		s.release(chaddr)
+	case 4: // DECLINE
+		s.decline(chaddr, requestedIP)
+	case 8: // INFORM
+		// Respond with ACK containing config but no IP assignment.
+		s.sendReply(dhcpAck, xid, chaddr, netip.Addr{})
 	}
 }
 
@@ -191,10 +200,16 @@ func (s *DHCPServer) allocate(mac [6]byte) netip.Addr {
 	}
 
 	for ip := s.cfg.RangeStart; ip.Compare(s.cfg.RangeEnd) <= 0; ip = ip.Next() {
-		if !assigned[ip] {
-			s.leases[mac] = &dhcpLease{ip: ip, mac: mac, expiry: now.Add(s.cfg.LeaseTime)}
-			return ip
+		if assigned[ip] {
+			continue
 		}
+		// Skip declined IPs that haven't expired yet.
+		if exp, declined := s.declined[ip]; declined && now.Before(exp) {
+			continue
+		}
+		delete(s.declined, ip) // clean up expired decline
+		s.leases[mac] = &dhcpLease{ip: ip, mac: mac, expiry: now.Add(s.cfg.LeaseTime)}
+		return ip
 	}
 	return netip.Addr{} // pool exhausted
 }
@@ -220,6 +235,25 @@ func (s *DHCPServer) confirm(mac [6]byte, requested netip.Addr) netip.Addr {
 	return l.ip
 }
 
+// release frees the lease for the given client MAC.
+func (s *DHCPServer) release(mac [6]byte) {
+	s.mu.Lock()
+	delete(s.leases, mac)
+	s.mu.Unlock()
+}
+
+// decline marks an IP as unusable for a period (client detected a conflict).
+func (s *DHCPServer) decline(mac [6]byte, ip netip.Addr) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Remove the lease.
+	delete(s.leases, mac)
+	// Mark the IP as declined for the lease duration.
+	if ip.IsValid() {
+		s.declined[ip] = time.Now().Add(s.cfg.LeaseTime)
+	}
+}
+
 // sendReply constructs and sends a DHCP OFFER or ACK.
 func (s *DHCPServer) sendReply(msgType byte, xid uint32, chaddr [6]byte, yiaddr netip.Addr) {
 	// BOOTP reply
@@ -228,9 +262,11 @@ func (s *DHCPServer) sendReply(msgType byte, xid uint32, chaddr [6]byte, yiaddr 
 	buf[1] = 1 // htype: Ethernet
 	buf[2] = 6 // hlen
 	binary.BigEndian.PutUint32(buf[4:8], xid)
-	// yiaddr
-	ya := yiaddr.As4()
-	copy(buf[16:20], ya[:])
+	// yiaddr (zero for INFORM responses)
+	if yiaddr.IsValid() {
+		ya := yiaddr.As4()
+		copy(buf[16:20], ya[:])
+	}
 	// siaddr (server IP)
 	sa := s.cfg.ServerIP.As4()
 	copy(buf[20:24], sa[:])

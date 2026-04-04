@@ -29,9 +29,11 @@ type L2Adapter struct {
 
 	gateway atomic.Value // netip.Addr — next-hop for off-subnet destinations
 
-	arp     *arpTable
-	pending *arpPending
-	dhcp    *dhcpClient
+	arp        *arpTable
+	ndp        *ndpTable
+	pending    *arpPending // shared for ARP and NDP
+	ndpPending *arpPending // separate pending queue for NDP
+	dhcp       *dhcpClient
 
 	framePool sync.Pool
 }
@@ -47,10 +49,12 @@ func NewL2Adapter(dev L3Device, mac net.HardwareAddr) *L2Adapter {
 		mac[0] = mac[0]&0xFE | 0x02 // locally administered, unicast
 	}
 	a := &L2Adapter{
-		mac:     mac,
-		l3dev:   dev,
-		arp:     newARPTable(),
-		pending: newARPPending(),
+		mac:        mac,
+		l3dev:      dev,
+		arp:        newARPTable(),
+		ndp:        newNDPTable(),
+		pending:    newARPPending(),
+		ndpPending: newARPPending(),
 		framePool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, defaultFrameBufSize)
@@ -89,9 +93,11 @@ func (a *L2Adapter) HWAddr() net.HardwareAddr {
 	return a.mac
 }
 
-// Close stops DHCP and releases resources.
+// Close stops DHCP, pending queue cleanup, and releases resources.
 func (a *L2Adapter) Close() error {
 	a.dhcp.Stop()
+	a.pending.Close()
+	a.ndpPending.Close()
 	return nil
 }
 
@@ -161,6 +167,13 @@ func (a *L2Adapter) handleIncomingL2Frame(f Frame) error {
 			}
 		}
 
+		// Intercept ICMPv6 NDP messages
+		if pkt.Version() == 6 && pkt.IPv6NextHeader() == ProtocolICMPv6 {
+			if a.handleNDP(pkt) {
+				return nil // consumed by NDP
+			}
+		}
+
 		// Forward to the wrapped L3 device.
 		a.l3dev.Send(pkt)
 	}
@@ -211,8 +224,23 @@ func (a *L2Adapter) handleOutgoingL3Packet(pkt Packet) {
 			dst := pkt.IPv6DstAddr().As16()
 			dstMAC = net.HardwareAddr{0x33, 0x33, dst[12], dst[13], dst[14], dst[15]}
 		} else {
-			// IPv6 unicast needs NDP, not implemented yet.
-			return
+			// IPv6 unicast: resolve via NDP (use gateway for off-link).
+			ndpTarget := pkt.IPv6DstAddr()
+			prefix := a.l3dev.Addr()
+			if prefix.IsValid() && prefix.Addr().Is6() && !prefix.Contains(ndpTarget) {
+				if gw, ok := a.gateway.Load().(netip.Addr); ok && gw.IsValid() && gw.Is6() {
+					ndpTarget = gw
+				}
+			}
+			mac, ok := a.ndp.Lookup(ndpTarget)
+			if !ok {
+				sendReq := a.ndpPending.Enqueue(ndpTarget, pkt)
+				if sendReq {
+					a.sendNeighborSolicitation(ndpTarget)
+				}
+				return
+			}
+			dstMAC = mac
 		}
 	default:
 		return
@@ -276,6 +304,88 @@ func (a *L2Adapter) sendARPReply(dstMAC net.HardwareAddr, dstIP netip.Addr) {
 	ourAddr := a.l3dev.Addr().Addr()
 	payload := buildARPPacket(arpOpReply, a.mac, ourAddr, dstMAC, dstIP)
 	frame := NewFrame(dstMAC, a.mac, EtherTypeARP, payload)
+	a.sendL2(frame)
+}
+
+// --- NDP handling ---
+
+// handleNDP processes incoming ICMPv6 NDP messages. Returns true if consumed.
+func (a *L2Adapter) handleNDP(pkt Packet) bool {
+	icmp := pkt.IPv6Payload()
+	if len(icmp) < 4 {
+		return false
+	}
+	srcAddr := pkt.IPv6SrcAddr()
+
+	switch icmp[0] {
+	case icmpv6NeighborSolicitation:
+		if len(icmp) < 24 {
+			return false
+		}
+		targetAddr := netip.AddrFrom16([16]byte(icmp[8:24]))
+		// Learn sender if source link-layer option present
+		if srcMAC := parseNDPOption(icmp[24:], ndpOptSourceLinkAddr); srcMAC != nil && srcAddr.IsValid() {
+			a.ndp.Set(srcAddr, srcMAC, ndpDefaultTTL)
+		}
+		// Respond if targeted at our address
+		llAddr := linkLocalFromMAC(a.mac)
+		devAddr := a.l3dev.Addr().Addr()
+		if targetAddr == llAddr || (devAddr.Is6() && targetAddr == devAddr) {
+			a.sendNeighborAdvertisement(srcAddr, targetAddr)
+		}
+		return true
+
+	case icmpv6NeighborAdvertisement:
+		if len(icmp) < 24 {
+			return false
+		}
+		targetAddr := netip.AddrFrom16([16]byte(icmp[8:24]))
+		// Learn from target link-layer option
+		if targetMAC := parseNDPOption(icmp[24:], ndpOptTargetLinkAddr); targetMAC != nil {
+			a.ndp.Set(targetAddr, targetMAC, ndpDefaultTTL)
+			// Drain pending packets
+			if pending := a.ndpPending.Drain(targetAddr); len(pending) > 0 {
+				for _, p := range pending {
+					a.handleOutgoingL3Packet(p)
+				}
+			}
+		}
+		return true
+
+	case icmpv6RouterSolicitation, icmpv6RouterAdvertisement:
+		// Pass through to L3 device (not consumed here)
+		return false
+	}
+	return false
+}
+
+// sendNeighborSolicitation sends an ICMPv6 NS for the given target address.
+func (a *L2Adapter) sendNeighborSolicitation(target netip.Addr) {
+	srcAddr := linkLocalFromMAC(a.mac)
+	dstAddr := solicitedNodeMulticast(target)
+	dstMAC := solicitedNodeMAC(target)
+
+	icmpPayload := buildNeighborSolicitation(a.mac, target)
+	ipPkt := wrapICMPv6(srcAddr, dstAddr, icmpPayload)
+	frame := NewFrame(dstMAC, a.mac, EtherTypeIPv6, ipPkt)
+	a.sendL2(frame)
+}
+
+// sendNeighborAdvertisement sends an ICMPv6 NA in response to an NS.
+func (a *L2Adapter) sendNeighborAdvertisement(dstAddr netip.Addr, targetAddr netip.Addr) {
+	srcAddr := targetAddr // source is the address being advertised
+	var dstMAC net.HardwareAddr
+	if mac, ok := a.ndp.Lookup(dstAddr); ok {
+		dstMAC = mac
+	} else {
+		// Multicast fallback if we don't know the requester's MAC
+		d := dstAddr.As16()
+		dstMAC = net.HardwareAddr{0x33, 0x33, d[12], d[13], d[14], d[15]}
+	}
+
+	icmpPayload := buildNeighborAdvertisement(a.mac, targetAddr, true)
+	ipPkt := wrapICMPv6(srcAddr, dstAddr, icmpPayload)
+	frame := NewFrame(dstMAC, a.mac, EtherTypeIPv6, ipPkt)
 	a.sendL2(frame)
 }
 
