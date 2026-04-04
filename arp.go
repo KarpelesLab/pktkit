@@ -45,7 +45,10 @@ func (t *arpTable) Lookup(ip netip.Addr) (net.HardwareAddr, bool) {
 	}
 	if time.Now().After(e.expires) {
 		t.mu.Lock()
-		delete(t.entries, ip)
+		// Re-check under write lock: another goroutine may have refreshed this entry.
+		if e2, ok := t.entries[ip]; ok && time.Now().After(e2.expires) {
+			delete(t.entries, ip)
+		}
 		t.mu.Unlock()
 		return nil, false
 	}

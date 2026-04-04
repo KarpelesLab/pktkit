@@ -129,7 +129,7 @@ func TestUDPConn6HandleOutbound(t *testing.T) {
 	payload := []byte("Hello IPv6 UDP!")
 	udpPacket := createUDPPacket6(srcIP, dstIP, 54321, uint16(actualServerAddr.Port), payload)
 
-	err = conn.handleOutbound(udpPacket)
+	err = conn.handleOutbound(udpPacket, 40)
 	if err != nil {
 		t.Fatalf("handleOutbound failed: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestUDPConn6HandleOutboundShortPacket(t *testing.T) {
 	// Packet too short (< 48 bytes)
 	shortPacket := make([]byte, 40)
 	shortPacket[0] = 0x60
-	err = conn.handleOutbound(shortPacket)
+	err = conn.handleOutbound(shortPacket, 40)
 	if err != nil {
 		t.Errorf("handleOutbound should handle short packets gracefully, got: %v", err)
 	}

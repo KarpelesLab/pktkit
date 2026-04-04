@@ -118,12 +118,11 @@ func (l *Listener) Accept() (net.Conn, error) {
 	}
 }
 
-// Close closes the listener.
+// Close closes the listener and aborts any queued but un-accepted connections.
 func (l *Listener) Close() error {
 	l.closeOnce.Do(func() {
 		close(l.closeCh)
 		l.s.mu.Lock()
-		defer l.s.mu.Unlock()
 		var ip [4]byte
 		if len(l.addr.IP) == 16 {
 			copy(ip[:], l.addr.IP[12:16])
@@ -131,6 +130,16 @@ func (l *Listener) Close() error {
 			copy(ip[:], l.addr.IP)
 		}
 		delete(l.s.listeners, listenerKey{ip: ip, port: uint16(l.addr.Port)})
+		l.s.mu.Unlock()
+		// Drain and abort any connections queued in acceptCh.
+		for {
+			select {
+			case conn := <-l.acceptCh:
+				conn.Close()
+			default:
+				return
+			}
+		}
 	})
 	return nil
 }
@@ -153,15 +162,24 @@ func (l *Listener6) Accept() (net.Conn, error) {
 	}
 }
 
-// Close closes the listener.
+// Close closes the listener and aborts any queued but un-accepted connections.
 func (l *Listener6) Close() error {
 	l.closeOnce.Do(func() {
 		close(l.closeCh)
 		l.s.mu.Lock()
-		defer l.s.mu.Unlock()
 		var ip [16]byte
 		copy(ip[:], l.addr.IP)
 		delete(l.s.listeners6, listenerKey6{ip: ip, port: uint16(l.addr.Port)})
+		l.s.mu.Unlock()
+		// Drain and abort any connections queued in acceptCh.
+		for {
+			select {
+			case conn := <-l.acceptCh:
+				conn.Close()
+			default:
+				return
+			}
+		}
 	})
 	return nil
 }

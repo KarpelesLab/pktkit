@@ -59,6 +59,16 @@ func NewPPTPHelper() *PPTPHelper {
 func (h *PPTPHelper) Name() string { return "pptp" }
 func (h *PPTPHelper) Close() error { return nil }
 
+// cleanupCalls removes stale PPTP call entries. Must be called with h.mu held.
+func (h *PPTPHelper) cleanupCalls() {
+	now := time.Now()
+	for id, info := range h.calls {
+		if now.Sub(info.created) > pptpGRETimeout {
+			delete(h.calls, id)
+		}
+	}
+}
+
 // MatchOutbound returns true for TCP traffic to port 1723.
 func (h *PPTPHelper) MatchOutbound(proto uint8, dstPort uint16) bool {
 	return proto == protoTCP && dstPort == pptpPort
@@ -98,6 +108,7 @@ func (h *PPTPHelper) ProcessOutbound(n *NAT, pkt pktkit.Packet, m *NATMapping) p
 
 		// Track the call
 		h.mu.Lock()
+		h.cleanupCalls()
 		h.calls[callID] = pptpCallInfo{
 			insideCallID:  callID,
 			outsideCallID: callID, // keep same call ID unless collision

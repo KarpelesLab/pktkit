@@ -14,14 +14,14 @@ const (
 	ICMPv6TypeNeighborAdvertisement = 136
 )
 
-// handleICMPv6 processes ICMPv6 packets
-func (s *Stack) handleICMPv6(packet []byte, srcIP, dstIP [16]byte) error {
-	// ICMPv6 starts at byte 40 (after IPv6 header)
-	if len(packet) < 48 { // 40 byte IPv6 header + 8 byte minimum ICMPv6
+// handleICMPv6 processes ICMPv6 packets. transportOff is the byte offset
+// where the ICMPv6 header begins (after any extension headers).
+func (s *Stack) handleICMPv6(packet []byte, srcIP, dstIP [16]byte, transportOff int) error {
+	if len(packet) < transportOff+8 {
 		return nil
 	}
 
-	icmp := packet[40:]
+	icmp := packet[transportOff:]
 	if len(icmp) < 8 {
 		return nil
 	}
@@ -30,7 +30,7 @@ func (s *Stack) handleICMPv6(packet []byte, srcIP, dstIP [16]byte) error {
 
 	switch icmpType {
 	case ICMPv6TypeEchoRequest:
-		return s.handleICMPv6EchoRequest(packet, srcIP, dstIP)
+		return s.handleICMPv6EchoRequest(packet, srcIP, dstIP, transportOff)
 
 	case ICMPv6TypeRouterSolicitation:
 		// Router Solicitation - typically we ignore this in a NAT context
@@ -46,9 +46,11 @@ func (s *Stack) handleICMPv6(packet []byte, srcIP, dstIP [16]byte) error {
 }
 
 // handleICMPv6EchoRequest handles ping6 requests
-func (s *Stack) handleICMPv6EchoRequest(packet []byte, srcIP, dstIP [16]byte) error {
-	// Extract the ICMPv6 payload
-	icmp := packet[40:]
+func (s *Stack) handleICMPv6EchoRequest(packet []byte, srcIP, dstIP [16]byte, transportOff int) error {
+	if len(packet) < transportOff+8 {
+		return nil
+	}
+	icmp := packet[transportOff:]
 	if len(icmp) < 8 {
 		return nil
 	}

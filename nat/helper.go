@@ -1,6 +1,7 @@
 package nat
 
 import (
+	"errors"
 	"net/netip"
 	"time"
 
@@ -89,12 +90,19 @@ func (n *NAT) AddExpectation(e Expectation) {
 
 // AddPortForward creates a static port mapping. Inbound connections to
 // outsidePort are forwarded to insideIP:insidePort.
+// Returns an error if the outside port is already forwarded to a different inside IP.
 func (n *NAT) AddPortForward(pf PortForward) error {
 	rk := natRevKey{proto: pf.Proto, port: pf.OutsidePort}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.forwards == nil {
 		n.forwards = make(map[natRevKey]*PortForward)
+	}
+	// Reject if already forwarded to a different inside client.
+	if existing, ok := n.forwards[rk]; ok {
+		if existing.InsideIP != pf.InsideIP {
+			return errors.New("port already forwarded to another host")
+		}
 	}
 	pfCopy := pf
 	n.forwards[rk] = &pfCopy

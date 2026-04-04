@@ -2,7 +2,6 @@ package vclient
 
 import (
 	"encoding/binary"
-	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -56,7 +55,7 @@ func (u *UDPConn) Read(b []byte) (int, error) {
 
 	for len(u.recvBuf) == 0 {
 		if u.closedForRead {
-			return 0, errors.New("connection closed")
+			return 0, net.ErrClosed
 		}
 
 		// Check read deadline
@@ -87,7 +86,7 @@ func (u *UDPConn) Read(b []byte) (int, error) {
 
 func (u *UDPConn) Write(b []byte) (int, error) {
 	if u.closed.Load() {
-		return 0, errors.New("connection closed")
+		return 0, net.ErrClosed
 	}
 	return u.writePacket(b)
 }
@@ -214,7 +213,7 @@ func (u *UDPConn6) Read(b []byte) (int, error) {
 
 	for len(u.recvBuf) == 0 {
 		if u.closedForRead {
-			return 0, errors.New("connection closed")
+			return 0, net.ErrClosed
 		}
 
 		// Check read deadline
@@ -244,7 +243,7 @@ func (u *UDPConn6) Read(b []byte) (int, error) {
 
 func (u *UDPConn6) Write(b []byte) (int, error) {
 	if u.closed.Load() {
-		return 0, errors.New("connection closed")
+		return 0, net.ErrClosed
 	}
 	return u.writePacket(b)
 }

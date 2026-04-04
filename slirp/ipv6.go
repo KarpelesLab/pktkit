@@ -63,7 +63,7 @@ func (s *Stack) handleIPv6(packet []byte) error {
 		if len(packet) < transportOff+8 {
 			return nil
 		}
-		return s.handleICMPv6(packet, srcIP, dstIP)
+		return s.handleICMPv6(packet, srcIP, dstIP, transportOff)
 
 	default:
 		// Unsupported protocol
@@ -146,6 +146,12 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 			}
 			select {
 			case listener.acceptCh <- vc:
+			case <-listener.closeCh:
+				// Listener closed — abort connection
+				vc.Abort()
+				s.mu.Lock()
+				delete(s.virtTCP6, k)
+				s.mu.Unlock()
 			default:
 				// Accept queue full — clean up
 				vc.Abort()
@@ -214,6 +220,9 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 			// No ACK: send RST+ACK with SEQ=0, ACK=SEG.SEQ+SEG.LEN
 			segSEQ := binary.BigEndian.Uint32(tcp[4:8])
 			dataOff := int(tcp[12]>>4) * 4
+			if dataOff > len(tcp) {
+				dataOff = len(tcp)
+			}
 			dataLen := uint32(len(tcp) - dataOff)
 			if (tcp[13] & 0x01) != 0 { // FIN flag
 				dataLen++
@@ -308,7 +317,7 @@ func (s *Stack) handleIPv6UDP(packet []byte, srcIP, dstIP [16]byte, transportOff
 		s.udp6[k] = u
 	}
 	s.mu.Unlock()
-	return u.handleOutbound(packet)
+	return u.handleOutbound(packet, transportOff)
 }
 
 // IPv6Checksum calculates the pseudo-header checksum for IPv6 TCP/UDP.

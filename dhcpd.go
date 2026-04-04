@@ -221,12 +221,28 @@ func (s *DHCPServer) confirm(mac [6]byte, requested netip.Addr) netip.Addr {
 
 	l, ok := s.leases[mac]
 	if !ok {
-		// No existing lease — try to grant the requested IP
-		if requested.IsValid() {
-			s.leases[mac] = &dhcpLease{ip: requested, mac: mac, expiry: time.Now().Add(s.cfg.LeaseTime)}
-			return requested
+		// No existing lease — try to grant the requested IP if it's valid and in range.
+		if !requested.IsValid() {
+			return netip.Addr{}
 		}
-		return netip.Addr{}
+		if requested == s.cfg.ServerIP {
+			return netip.Addr{} // can't lease the server's own IP
+		}
+		if requested.Compare(s.cfg.RangeStart) < 0 || requested.Compare(s.cfg.RangeEnd) > 0 {
+			return netip.Addr{} // outside the configured pool
+		}
+		// Check for conflicts with existing leases.
+		now := time.Now()
+		for _, other := range s.leases {
+			if other.ip == requested && now.Before(other.expiry) {
+				return netip.Addr{} // already leased to another client
+			}
+		}
+		if exp, declined := s.declined[requested]; declined && now.Before(exp) {
+			return netip.Addr{} // currently declined
+		}
+		s.leases[mac] = &dhcpLease{ip: requested, mac: mac, expiry: now.Add(s.cfg.LeaseTime)}
+		return requested
 	}
 	if requested.IsValid() && requested != l.ip {
 		return netip.Addr{} // mismatch
@@ -256,8 +272,14 @@ func (s *DHCPServer) decline(mac [6]byte, ip netip.Addr) {
 
 // sendReply constructs and sends a DHCP OFFER or ACK.
 func (s *DHCPServer) sendReply(msgType byte, xid uint32, chaddr [6]byte, yiaddr netip.Addr) {
-	// BOOTP reply
-	buf := make([]byte, 300)
+	// BOOTP reply — allocate enough for header + options including DNS servers.
+	// 240 (BOOTP header + magic cookie) + 3 (msg type) + 6 (subnet) + 6 (router)
+	// + 2 + 4*len(DNS) + 6 (lease time) + 6 (server ID) + 1 (end) = 270 + 4*len(DNS)
+	bufSize := 270 + len(s.cfg.DNS)*4
+	if bufSize < 300 {
+		bufSize = 300 // BOOTP minimum
+	}
+	buf := make([]byte, bufSize)
 	buf[0] = 2 // op: BOOTREPLY
 	buf[1] = 1 // htype: Ethernet
 	buf[2] = 6 // hlen
@@ -317,17 +339,18 @@ func (s *DHCPServer) sendReply(msgType byte, xid uint32, chaddr [6]byte, yiaddr 
 		}
 	}
 
-	// Lease time
-	buf[off] = dhcpOptLeaseTime
-	buf[off+1] = 4
-	binary.BigEndian.PutUint32(buf[off+2:off+6], uint32(s.cfg.LeaseTime.Seconds()))
-	off += 6
+	// Lease time and server identifier — omit for INFORM responses (no IP assigned).
+	if yiaddr.IsValid() {
+		buf[off] = dhcpOptLeaseTime
+		buf[off+1] = 4
+		binary.BigEndian.PutUint32(buf[off+2:off+6], uint32(s.cfg.LeaseTime.Seconds()))
+		off += 6
 
-	// Server identifier
-	buf[off] = dhcpOptServerID
-	buf[off+1] = 4
-	copy(buf[off+2:off+6], sa[:])
-	off += 6
+		buf[off] = dhcpOptServerID
+		buf[off+1] = 4
+		copy(buf[off+2:off+6], sa[:])
+		off += 6
+	}
 
 	buf[off] = dhcpOptEnd
 	off++

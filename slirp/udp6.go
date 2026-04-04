@@ -35,12 +35,11 @@ func newUDPConn6(srcIP [16]byte, srcPort uint16, dstIP [16]byte, dstPort uint16,
 	return u, nil
 }
 
-func (u *udpConn6) handleOutbound(packet []byte) error {
-	// IPv6 header is fixed 40 bytes, UDP starts at byte 40
-	if len(packet) < 48 { // 40 byte IPv6 header + 8 byte UDP header
+func (u *udpConn6) handleOutbound(packet []byte, transportOff int) error {
+	if len(packet) < transportOff+8 {
 		return nil
 	}
-	udp := packet[40:]
+	udp := packet[transportOff:]
 	if len(udp) < 8 {
 		return nil
 	}

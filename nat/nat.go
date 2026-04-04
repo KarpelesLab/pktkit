@@ -65,7 +65,7 @@ type NAT struct {
 	helpers      []Helper
 	forwards     map[natRevKey]*PortForward
 	expectations []Expectation
-	defragger    *Defragger // nil if not enabled
+	defragger    atomic.Pointer[Defragger]
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -102,9 +102,8 @@ func (n *NAT) Close() error {
 		n.mu.Lock()
 		helpers := n.helpers
 		n.helpers = nil
-		if n.defragger != nil {
-			n.defragger.Close()
-			n.defragger = nil
+		if d := n.defragger.Swap(nil); d != nil {
+			d.Close()
 		}
 		n.mu.Unlock()
 		for _, h := range helpers {
@@ -166,9 +165,9 @@ func (n *NAT) SendInside(pkt pktkit.Packet) {
 // --- Outbound: inside → outside ---
 
 func (n *NAT) handleOutbound(pkt pktkit.Packet) {
-	// Defragment if enabled.
-	if n.defragger != nil {
-		pkt = n.defragger.Process(pkt)
+	// Defragment if enabled (atomic load — no lock needed on the hot path).
+	if d := n.defragger.Load(); d != nil {
+		pkt = d.Process(pkt)
 		if pkt == nil {
 			return // fragment buffered, waiting for more
 		}
@@ -287,9 +286,9 @@ func (n *NAT) handleOutboundICMP(pkt pktkit.Packet, ihl int) {
 // --- Inbound: outside → inside ---
 
 func (n *NAT) handleInbound(pkt pktkit.Packet) {
-	// Defragment if enabled.
-	if n.defragger != nil {
-		pkt = n.defragger.Process(pkt)
+	// Defragment if enabled (atomic load — no lock needed on the hot path).
+	if d := n.defragger.Load(); d != nil {
+		pkt = d.Process(pkt)
 		if pkt == nil {
 			return
 		}
@@ -332,18 +331,16 @@ func (n *NAT) handleInboundTCPUDP(pkt pktkit.Packet, ihl int, proto uint8) {
 	// No existing mapping — check expectations and port forwards.
 	if m == nil {
 		if e := n.matchExpectation(proto, srcIP, srcPort, dstPort); e != nil {
-			// Create mapping from expectation.
+			// Create mapping from expectation, reusing the outside port that
+			// the remote is already sending to (no separate port allocation needed).
 			k := natKey{proto: proto, ip: e.InsideIP, port: e.InsidePort}
-			port := n.allocPort()
-			if port != 0 {
-				m = &natMapping{
-					key:         k,
-					outsidePort: dstPort, // reuse the port the remote is sending to
-					lastActive:  time.Now(),
-				}
-				n.mappings[k] = m
-				n.reverse[rk] = m
+			m = &natMapping{
+				key:         k,
+				outsidePort: dstPort,
+				lastActive:  time.Now(),
 			}
+			n.mappings[k] = m
+			n.reverse[rk] = m
 		}
 	}
 	if m == nil {

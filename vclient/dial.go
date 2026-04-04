@@ -136,6 +136,7 @@ func (c *Client) dialTCP(ctx context.Context, localIP, remoteIP [4]byte, remoteP
 	c.tcpMu.Lock()
 	c.tcpConns[k] = conn
 	c.tcpMu.Unlock()
+	c.releasePort(localPort)
 
 	// Initiate handshake
 	if err := vc.Connect(ctx); err != nil {
@@ -156,6 +157,7 @@ func (c *Client) dialUDP(localIP, remoteIP [4]byte, remotePort uint16) (net.Conn
 	c.udpMu.Lock()
 	c.udpConns[k] = conn
 	c.udpMu.Unlock()
+	c.releasePort(localPort)
 
 	return conn, nil
 }
@@ -184,6 +186,7 @@ func (c *Client) dialTCP6(ctx context.Context, localIP, remoteIP [16]byte, remot
 	c.tcpMu.Lock()
 	c.tcpConns6[k] = conn
 	c.tcpMu.Unlock()
+	c.releasePort(localPort)
 
 	// Initiate handshake
 	if err := vc.Connect(ctx); err != nil {
@@ -204,6 +207,7 @@ func (c *Client) dialUDP6(localIP, remoteIP [16]byte, remotePort uint16) (net.Co
 	c.udpMu.Lock()
 	c.udpConns6[k] = conn
 	c.udpMu.Unlock()
+	c.releasePort(localPort)
 
 	return conn, nil
 }

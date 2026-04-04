@@ -51,6 +51,9 @@ func (c *Client) LookupHost(ctx context.Context, host string) ([]string, error) 
 	// Build DNS query
 	id := uint16(rand.Uint32())
 	query := buildDNSQuery(id, host, 1) // A record
+	if query == nil {
+		return nil, errors.New("invalid hostname: label too long")
+	}
 
 	// Send query
 	if _, err := conn.Write(query); err != nil {
@@ -125,6 +128,9 @@ func (c *Client) lookupHostIPv6(ctx context.Context, host string) ([]string, err
 	// Build DNS query
 	id := uint16(rand.Uint32())
 	query := buildDNSQuery(id, host, 1) // A record
+	if query == nil {
+		return nil, errors.New("invalid hostname: label too long")
+	}
 
 	// Send query
 	if _, err := conn.Write(query); err != nil {
@@ -224,6 +230,7 @@ func (c *Client) Resolver() *net.Resolver {
 }
 
 // buildDNSQuery builds a DNS query packet for the given name and type.
+// Returns nil if the name contains labels exceeding 63 bytes.
 func buildDNSQuery(id uint16, name string, qtype uint16) []byte {
 	// Header: 12 bytes
 	hdr := make([]byte, 12)
@@ -234,6 +241,9 @@ func buildDNSQuery(id uint16, name string, qtype uint16) []byte {
 
 	// Question section
 	qname := encodeDNSName(name)
+	if qname == nil {
+		return nil
+	}
 	question := make([]byte, len(qname)+4)
 	copy(question, qname)
 	binary.BigEndian.PutUint16(question[len(qname):], qtype) // QTYPE
@@ -246,11 +256,15 @@ func buildDNSQuery(id uint16, name string, qtype uint16) []byte {
 }
 
 // encodeDNSName encodes a domain name in DNS wire format.
+// Returns nil if any label exceeds 63 bytes (RFC 1035 §2.3.4).
 func encodeDNSName(name string) []byte {
 	name = strings.TrimSuffix(name, ".")
 	parts := strings.Split(name, ".")
 	var buf []byte
 	for _, part := range parts {
+		if len(part) > 63 {
+			return nil // label too long
+		}
 		buf = append(buf, byte(len(part)))
 		buf = append(buf, []byte(part)...)
 	}

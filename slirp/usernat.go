@@ -226,6 +226,12 @@ func (s *Stack) handleIPv4(ip []byte) error {
 
 				select {
 				case listener.acceptCh <- vc:
+				case <-listener.closeCh:
+					// Listener closed — abort connection
+					vc.Abort()
+					s.mu.Lock()
+					delete(s.virtTCP, k)
+					s.mu.Unlock()
 				default:
 					// Accept queue full — clean up
 					vc.Abort()
@@ -294,6 +300,9 @@ func (s *Stack) handleIPv4(ip []byte) error {
 				// No ACK: send RST+ACK with SEQ=0, ACK=SEG.SEQ+SEG.LEN
 				segSEQ := binary.BigEndian.Uint32(tcp[4:8])
 				dataOff := int(tcp[12]>>4) * 4
+				if dataOff > len(tcp) {
+					dataOff = len(tcp)
+				}
 				dataLen := uint32(len(tcp) - dataOff)
 				if (tcp[13] & 0x01) != 0 { // FIN flag
 					dataLen++

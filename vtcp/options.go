@@ -67,9 +67,9 @@ func BuildOptions(opts []Option) []byte {
 		buf = append(buf, o.Kind, byte(2+len(o.Data)))
 		buf = append(buf, o.Data...)
 	}
-	// Pad to 4-byte boundary
+	// Pad to 4-byte boundary with zero (RFC 793: padding after End-of-Option is zero)
 	for len(buf)%4 != 0 {
-		buf = append(buf, OptNOP)
+		buf = append(buf, OptEnd)
 	}
 	return buf
 }

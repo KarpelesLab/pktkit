@@ -367,9 +367,11 @@ func (c *Conn) Connect(ctx context.Context) error {
 }
 
 func (c *Conn) sendBufSize() int {
-	// Check if we have a configured size
 	if c.sendBuf != nil {
 		return c.sendBuf.cap
+	}
+	if c.sendBufCap > 0 {
+		return c.sendBufCap
 	}
 	return DefaultSendBuf
 }
@@ -427,6 +429,9 @@ func (c *Conn) negotiateOptions(remoteOpts []Option) {
 	// We always offer it unless NoWindowScaling was set (rcvWndShift stays 0
 	// but we still send WScale(0) in the SYN options).
 	if ws := GetWScale(remoteOpts); ws >= 0 {
+		if ws > 14 {
+			ws = 14 // RFC 7323: maximum window scale shift is 14
+		}
 		c.sndWndShift = uint8(ws)
 		c.wscaleOK = true
 	}
@@ -921,6 +926,8 @@ func (c *Conn) handleClosing(seg Segment) [][]byte {
 		c.stopRTO()
 		c.startTimeWait()
 	}
+	// Always re-ACK so retransmitted FINs (from a lost ACK) don't stall teardown.
+	c.queueACK()
 	return c.drainOutgoing()
 }
 
@@ -1331,7 +1338,15 @@ func (c *Conn) onKeepalive() {
 		c.keepaliveSent++
 	}
 
-	c.startKeepalive()
+	// After a probe has been sent, use the shorter probe interval (RFC 1122).
+	// Otherwise use the idle interval for the initial check.
+	if c.keepaliveSent > 0 {
+		c.stopKeepalive()
+		c.stopPersist()
+		c.keepaliveTimer = time.AfterFunc(c.keepaliveIntv, c.onKeepalive)
+	} else {
+		c.startKeepalive()
+	}
 	pkts := c.drainOutgoing()
 	c.mu.Unlock()
 	c.flushPackets(pkts)

@@ -155,12 +155,12 @@ func (a *L2Adapter) handleIncomingL2Frame(f Frame) error {
 			return nil
 		}
 
-		// Intercept DHCP responses (IPv4 UDP port 68)
+		// Intercept DHCP responses (IPv4 UDP port 68) only when DHCP is active.
 		if pkt.Version() == 4 && pkt.IPv4Protocol() == ProtocolUDP {
 			udpPayload := pkt.IPv4Payload()
 			if len(udpPayload) >= 8 {
 				dstPort := binary.BigEndian.Uint16(udpPayload[2:4])
-				if dstPort == 68 {
+				if dstPort == 68 && a.dhcp.isActive() {
 					a.dhcp.HandlePacket(udpPayload[8:])
 					return nil
 				}
@@ -323,15 +323,22 @@ func (a *L2Adapter) handleNDP(pkt Packet) bool {
 			return false
 		}
 		targetAddr := netip.AddrFrom16([16]byte(icmp[8:24]))
-		// Learn sender if source link-layer option present
-		if srcMAC := parseNDPOption(icmp[24:], ndpOptSourceLinkAddr); srcMAC != nil && srcAddr.IsValid() {
+		// Learn sender if source link-layer option present.
+		// RFC 4861 §7.1.1: if source is unspecified (DAD), do NOT learn.
+		if srcMAC := parseNDPOption(icmp[24:], ndpOptSourceLinkAddr); srcMAC != nil && srcAddr.IsValid() && !srcAddr.IsUnspecified() {
 			a.ndp.Set(srcAddr, srcMAC, ndpDefaultTTL)
 		}
-		// Respond if targeted at our address
+		// Respond if targeted at our address.
 		llAddr := linkLocalFromMAC(a.mac)
 		devAddr := a.l3dev.Addr().Addr()
 		if targetAddr == llAddr || (devAddr.Is6() && targetAddr == devAddr) {
-			a.sendNeighborAdvertisement(srcAddr, targetAddr)
+			if srcAddr.IsUnspecified() {
+				// DAD NS: respond to all-nodes multicast, solicited=false (RFC 4861 §7.2.4).
+				allNodes := netip.MustParseAddr("ff02::1")
+				a.sendNeighborAdvertisement(allNodes, targetAddr)
+			} else {
+				a.sendNeighborAdvertisement(srcAddr, targetAddr)
+			}
 		}
 		return true
 
@@ -383,7 +390,10 @@ func (a *L2Adapter) sendNeighborAdvertisement(dstAddr netip.Addr, targetAddr net
 		dstMAC = net.HardwareAddr{0x33, 0x33, d[12], d[13], d[14], d[15]}
 	}
 
-	icmpPayload := buildNeighborAdvertisement(a.mac, targetAddr, true)
+	// RFC 4861 §7.2.4: solicited flag MUST NOT be set when responding to
+	// a DAD NS (destination is multicast, not unicast).
+	solicited := !dstAddr.IsMulticast()
+	icmpPayload := buildNeighborAdvertisement(a.mac, targetAddr, solicited)
 	ipPkt := wrapICMPv6(srcAddr, dstAddr, icmpPayload)
 	frame := NewFrame(dstMAC, a.mac, EtherTypeIPv6, ipPkt)
 	a.sendL2(frame)

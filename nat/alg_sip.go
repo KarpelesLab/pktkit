@@ -81,8 +81,14 @@ func (h *SIPHelper) ProcessOutbound(n *NAT, pkt pktkit.Packet, m *NATMapping) pk
 	newPayload = sipRewriteHeader(newPayload, []byte("Contact: "), []byte(insideHostPort), []byte(outsideHostPort))
 	newPayload = sipRewriteHeader(newPayload, []byte("m:"), []byte(insideHostPort), []byte(outsideHostPort))
 
-	// Also rewrite bare IP addresses in Via/Contact (without port)
-	newPayload = bytes.ReplaceAll(newPayload, []byte(insideAddr), []byte(outsideAddr))
+	// Rewrite bare IP addresses only in relevant SIP headers (Via, Contact),
+	// not globally across the entire message body.
+	newPayload = sipRewriteHeader(newPayload, []byte("Via:"), []byte(insideAddr), []byte(outsideAddr))
+	newPayload = sipRewriteHeader(newPayload, []byte("Via: "), []byte(insideAddr), []byte(outsideAddr))
+	newPayload = sipRewriteHeader(newPayload, []byte("v:"), []byte(insideAddr), []byte(outsideAddr))
+	newPayload = sipRewriteHeader(newPayload, []byte("Contact:"), []byte(insideAddr), []byte(outsideAddr))
+	newPayload = sipRewriteHeader(newPayload, []byte("Contact: "), []byte(insideAddr), []byte(outsideAddr))
+	newPayload = sipRewriteHeader(newPayload, []byte("m:"), []byte(insideAddr), []byte(outsideAddr))
 
 	// Process SDP body if present
 	sdpStart := bytes.Index(newPayload, []byte("\r\n\r\n"))
@@ -152,8 +158,13 @@ func (h *SIPHelper) ProcessInbound(n *NAT, pkt pktkit.Packet, m *NATMapping) pkt
 	newPayload = sipRewriteHeader(newPayload, []byte("Contact: "), []byte(outsideHostPort), []byte(insideHostPort))
 	newPayload = sipRewriteHeader(newPayload, []byte("m:"), []byte(outsideHostPort), []byte(insideHostPort))
 
-	// Replace bare IP addresses
-	newPayload = bytes.ReplaceAll(newPayload, []byte(outsideAddr), []byte(insideAddr))
+	// Rewrite bare IP addresses only in relevant SIP headers.
+	newPayload = sipRewriteHeader(newPayload, []byte("Via:"), []byte(outsideAddr), []byte(insideAddr))
+	newPayload = sipRewriteHeader(newPayload, []byte("Via: "), []byte(outsideAddr), []byte(insideAddr))
+	newPayload = sipRewriteHeader(newPayload, []byte("v:"), []byte(outsideAddr), []byte(insideAddr))
+	newPayload = sipRewriteHeader(newPayload, []byte("Contact:"), []byte(outsideAddr), []byte(insideAddr))
+	newPayload = sipRewriteHeader(newPayload, []byte("Contact: "), []byte(outsideAddr), []byte(insideAddr))
+	newPayload = sipRewriteHeader(newPayload, []byte("m:"), []byte(outsideAddr), []byte(insideAddr))
 
 	// Process SDP body
 	sdpStart := bytes.Index(newPayload, []byte("\r\n\r\n"))
@@ -230,17 +241,22 @@ func sipParseMediaLine(line []byte, n *NAT, m *NATMapping, outsideAddr string, r
 	}
 	insidePort := uint16(port)
 
-	// Allocate outside port for RTP (must be even)
-	rtpOutPort := n.AllocOutsidePort(protoUDP)
+	// Allocate an even outside port for RTP (RFC 3550 convention).
+	var rtpOutPort uint16
+	for attempts := 0; attempts < 100; attempts++ {
+		p := n.AllocOutsidePort(protoUDP)
+		if p == 0 {
+			return line, 0 // port pool exhausted
+		}
+		if p%2 == 0 {
+			rtpOutPort = p
+			break
+		}
+		// Odd port — release it back by not using it. The NAT port allocator
+		// is a simple counter, so we just keep trying until we find an even one.
+	}
 	if rtpOutPort == 0 {
 		return line, 0
-	}
-	// Ensure even port for RTP
-	if rtpOutPort%2 != 0 {
-		rtpOutPort = n.AllocOutsidePort(protoUDP)
-		if rtpOutPort == 0 {
-			return line, 0
-		}
 	}
 
 	// Create mapping and expectation for RTP
@@ -271,10 +287,32 @@ func sipParseMediaLine(line []byte, n *NAT, m *NATMapping, outsideAddr string, r
 	return bytes.Join(parts, []byte(" ")), insidePort
 }
 
-// sipRewriteHeader finds lines starting with prefix and replaces oldVal with
-// newVal within those lines.
+// sipRewriteHeader replaces oldVal with newVal only within header lines that
+// start with the given prefix (case-insensitive match on the prefix).
 func sipRewriteHeader(payload, prefix, oldVal, newVal []byte) []byte {
-	return bytes.ReplaceAll(payload, oldVal, newVal)
+	if bytes.Equal(oldVal, newVal) {
+		return payload
+	}
+	lowerPrefix := bytes.ToLower(prefix)
+	lines := bytes.Split(payload, []byte("\r\n"))
+	changed := false
+	for i, line := range lines {
+		if len(line) < len(prefix) {
+			continue
+		}
+		if !bytes.EqualFold(line[:len(prefix)], lowerPrefix) {
+			continue
+		}
+		newLine := bytes.ReplaceAll(line, oldVal, newVal)
+		if !bytes.Equal(newLine, line) {
+			lines[i] = newLine
+			changed = true
+		}
+	}
+	if !changed {
+		return payload
+	}
+	return bytes.Join(lines, []byte("\r\n"))
 }
 
 // sipUpdateContentLength rebuilds the SIP message with the correct
@@ -282,10 +320,23 @@ func sipRewriteHeader(payload, prefix, oldVal, newVal []byte) []byte {
 func sipUpdateContentLength(headers []byte, sdpBody []byte) []byte {
 	newCL := []byte(fmt.Sprintf("%d", len(sdpBody)))
 
-	// Find and rewrite Content-Length header
-	clIdx := bytes.Index(bytes.ToLower(headers), []byte("content-length:"))
+	// Find and rewrite Content-Length header.
+	lowerHeaders := bytes.ToLower(headers)
+	clIdx := bytes.Index(lowerHeaders, []byte("content-length:"))
 	if clIdx < 0 {
-		clIdx = bytes.Index(bytes.ToLower(headers), []byte("l:"))
+		// Try SIP compact form "l:" — must appear at start of a line.
+		for off := 0; off < len(lowerHeaders); {
+			idx := bytes.Index(lowerHeaders[off:], []byte("l:"))
+			if idx < 0 {
+				break
+			}
+			absIdx := off + idx
+			if absIdx == 0 || (absIdx >= 2 && lowerHeaders[absIdx-2] == '\r' && lowerHeaders[absIdx-1] == '\n') {
+				clIdx = absIdx
+				break
+			}
+			off = absIdx + 2
+		}
 	}
 
 	if clIdx >= 0 {

@@ -45,9 +45,9 @@ type Defragger struct {
 // EnableDefrag activates IP defragmentation on the NAT.
 func (n *NAT) EnableDefrag() {
 	d := newDefragger()
-	n.mu.Lock()
-	n.defragger = d
-	n.mu.Unlock()
+	if old := n.defragger.Swap(d); old != nil {
+		old.Close()
+	}
 }
 
 func newDefragger() *Defragger {
@@ -137,6 +137,12 @@ func (d *Defragger) Process(pkt pktkit.Packet) pktkit.Packet {
 		return nil // don't know total size yet
 	}
 
+	// Enforce maximum reassembled size (65535 = max IPv4 packet payload).
+	if e.total > 65535 {
+		delete(d.entries, k)
+		return nil
+	}
+
 	// Check coverage: all bytes from 0 to total must be covered.
 	covered := make([]bool, e.total)
 	var firstHdr []byte
@@ -146,6 +152,11 @@ func (d *Defragger) Process(pkt pktkit.Packet) pktkit.Packet {
 			end = e.total
 		}
 		for i := f.offset; i < end; i++ {
+			if covered[i] {
+				// Overlapping fragment detected — reject per RFC 5722 best practice.
+				delete(d.entries, k)
+				return nil
+			}
 			covered[i] = true
 		}
 		if f.hdr != nil {

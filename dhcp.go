@@ -58,6 +58,14 @@ func newDHCPClient(a *L2Adapter) *dhcpClient {
 	return &dhcpClient{adapter: a}
 }
 
+// isActive returns true if the DHCP client is actively running (not in Init state).
+func (d *dhcpClient) isActive() bool {
+	d.mu.Lock()
+	active := d.state != dhcpInit
+	d.mu.Unlock()
+	return active
+}
+
 // Start begins the DHCP discovery process.
 func (d *dhcpClient) Start() {
 	d.mu.Lock()
@@ -195,11 +203,16 @@ func (d *dhcpClient) HandlePacket(udpPayload []byte) {
 				}
 				d.timer = time.AfterFunc(d.leaseTime/2, func() {
 					d.mu.Lock()
-					if d.state == dhcpBound {
-						d.state = dhcpRenewing
+					if d.state != dhcpBound {
+						d.mu.Unlock()
+						return
 					}
+					d.state = dhcpRenewing
+					// Copy fields under lock to avoid a data race.
+					offeredIP := d.offeredIP
+					serverIP := d.serverIP
 					d.mu.Unlock()
-					d.sendRequest()
+					d.sendRenew(offeredIP, serverIP)
 				})
 			}
 		case dhcpNak:
@@ -224,8 +237,24 @@ func (d *dhcpClient) sendDiscover() {
 }
 
 func (d *dhcpClient) sendRequest() {
-	payload := d.buildDHCPMessage(dhcpRequest, d.offeredIP, d.serverIP)
+	d.mu.Lock()
+	offeredIP := d.offeredIP
+	serverIP := d.serverIP
+	d.mu.Unlock()
+	payload := d.buildDHCPMessage(dhcpRequest, offeredIP, serverIP)
 	d.sendDHCPFrame(payload)
+}
+
+// sendRenew sends a DHCPREQUEST for lease renewal per RFC 2131 §4.3.2:
+// unicast to the server, with ciaddr set to our current IP.
+func (d *dhcpClient) sendRenew(clientIP netip.Addr, serverIP netip.Addr) {
+	// During RENEWING, the request should NOT include Requested IP or Server ID
+	// options — ciaddr conveys the address being renewed.
+	payload := d.buildDHCPMessage(dhcpRequest, netip.Addr{}, netip.Addr{})
+	// Set ciaddr to our current address (bytes 12-15 of BOOTP header).
+	ip4 := clientIP.As4()
+	copy(payload[12:16], ip4[:])
+	d.sendRenewFrame(payload, clientIP, serverIP)
 }
 
 // buildDHCPMessage constructs a DHCP/BOOTP message payload.
@@ -321,6 +350,38 @@ func (d *dhcpClient) sendDHCPFrame(dhcpPayload []byte) {
 
 	// Ethernet frame
 	frame := NewFrame(broadcastMAC, d.adapter.mac, EtherTypeIPv4, ip)
+	d.adapter.sendL2(frame)
+}
+
+// sendRenewFrame wraps a DHCP payload for renewal: unicast from our IP to the server.
+func (d *dhcpClient) sendRenewFrame(dhcpPayload []byte, srcIP, dstIP netip.Addr) {
+	udpLen := 8 + len(dhcpPayload)
+	udp := make([]byte, udpLen)
+	binary.BigEndian.PutUint16(udp[0:2], 68)             // src port
+	binary.BigEndian.PutUint16(udp[2:4], 67)             // dst port
+	binary.BigEndian.PutUint16(udp[4:6], uint16(udpLen)) // length
+	copy(udp[8:], dhcpPayload)
+
+	ipLen := 20 + udpLen
+	ip := make([]byte, ipLen)
+	ip[0] = 0x45
+	binary.BigEndian.PutUint16(ip[2:4], uint16(ipLen))
+	ip[8] = 64
+	ip[9] = byte(ProtocolUDP)
+	s := srcIP.As4()
+	copy(ip[12:16], s[:])
+	dst := dstIP.As4()
+	copy(ip[16:20], dst[:])
+	csum := Checksum(ip[:20])
+	binary.BigEndian.PutUint16(ip[10:12], csum)
+	copy(ip[20:], udp)
+
+	// Unicast: resolve the server's MAC via ARP (use broadcast as fallback).
+	dstMAC := broadcastMAC
+	if mac, ok := d.adapter.arp.Lookup(dstIP); ok {
+		dstMAC = mac
+	}
+	frame := NewFrame(dstMAC, d.adapter.mac, EtherTypeIPv4, ip)
 	d.adapter.sendL2(frame)
 }
 

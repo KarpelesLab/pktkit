@@ -105,10 +105,16 @@ func (f Frame) IsMulticast() bool {
 
 // SetDstMAC writes the destination MAC address in place.
 func (f Frame) SetDstMAC(mac net.HardwareAddr) {
+	if len(f) < 14 {
+		return
+	}
 	copy(f[0:6], mac)
 }
 
 // SetSrcMAC writes the source MAC address in place.
 func (f Frame) SetSrcMAC(mac net.HardwareAddr) {
+	if len(f) < 14 {
+		return
+	}
 	copy(f[6:12], mac)
 }

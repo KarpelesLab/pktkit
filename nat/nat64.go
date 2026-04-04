@@ -212,7 +212,6 @@ func (n *NAT64) handleOutbound(pkt pktkit.Packet) {
 	}
 	dstIPv4 := ipv4FromMapped(dstIPv6)
 
-	nextHeader := pkt[6]
 	hopLimit := pkt[7]
 	payloadLen := int(binary.BigEndian.Uint16(pkt[4:6]))
 	srcIPv6 := netip.AddrFrom16([16]byte(pkt[8:24]))
@@ -220,7 +219,35 @@ func (n *NAT64) handleOutbound(pkt pktkit.Packet) {
 	if len(pkt) < ipv6HeaderLen+payloadLen {
 		return
 	}
-	transport := pkt[ipv6HeaderLen : ipv6HeaderLen+payloadLen]
+
+	// Walk extension headers to find the actual transport protocol.
+	nextHeader := pkt[6]
+	transportOff := ipv6HeaderLen
+	for {
+		switch nextHeader {
+		case 0, 43, 60: // Hop-by-Hop, Routing, Destination Options
+			if transportOff+2 > len(pkt) {
+				return
+			}
+			extLen := int(pkt[transportOff+1]+1) * 8
+			nextHeader = pkt[transportOff]
+			transportOff += extLen
+			continue
+		case 44: // Fragment Header (8 bytes fixed)
+			if transportOff+8 > len(pkt) {
+				return
+			}
+			nextHeader = pkt[transportOff]
+			transportOff += 8
+			continue
+		}
+		break
+	}
+
+	if transportOff > len(pkt) {
+		return
+	}
+	transport := pkt[transportOff:]
 
 	switch nextHeader {
 	case protoTCP, protoUDP:
@@ -474,36 +501,40 @@ func (n *NAT64) handleInboundICMP(icmpData []byte, srcIPv4 netip.Addr, ttl uint8
 	switch icmpType {
 	case 0: // Echo Reply → ICMPv6 Echo Reply (type 129)
 		n.handleInboundEchoReply(icmpData, srcIPv4, ttl)
-	case 3: // Destination Unreachable → ICMPv6 type 1
-		n.handleInboundICMPError(icmpData, srcIPv4, ttl, 1, icmpv4ToV6DestUnreachCode(icmpData[1]))
+	case 3: // Destination Unreachable → mapped per RFC 6145 §4.2
+		v6Type, v6Code := icmpv4ToV6DestUnreach(icmpData[1])
+		if v6Type != 0 {
+			n.handleInboundICMPError(icmpData, srcIPv4, ttl, v6Type, v6Code)
+		}
 	case 11: // Time Exceeded → ICMPv6 type 3
 		n.handleInboundICMPError(icmpData, srcIPv4, ttl, 3, icmpData[1])
 	}
 }
 
-// icmpv4ToV6DestUnreachCode maps ICMPv4 Destination Unreachable codes to ICMPv6.
-func icmpv4ToV6DestUnreachCode(code uint8) uint8 {
+// icmpv4ToV6DestUnreach maps ICMPv4 Destination Unreachable codes to ICMPv6
+// type and code per RFC 6145 §4.2. Returns (0, 0) if the code should be dropped.
+func icmpv4ToV6DestUnreach(code uint8) (icmpv6Type, icmpv6Code uint8) {
 	switch code {
-	case 0: // Net Unreachable → No route to destination
-		return 0
-	case 1: // Host Unreachable → No route to destination
-		return 0
-	case 2: // Protocol Unreachable → Address unreachable (no next header)
-		return 4
-	case 3: // Port Unreachable → Port unreachable
-		return 4
-	case 4: // Fragmentation Needed → Packet too big (handled separately in practice)
-		return 0
-	case 5: // Source Route Failed → Source address failed
-		return 5
-	case 6, 7: // Destination network/host unknown → No route
-		return 0
-	case 9, 10: // Administratively prohibited → Administratively prohibited
-		return 1
+	case 0: // Net Unreachable → Destination Unreachable, No route
+		return 1, 0
+	case 1: // Host Unreachable → Destination Unreachable, No route
+		return 1, 0
+	case 2: // Protocol Unreachable → Parameter Problem, Unrecognized Next Header (RFC 6145 §4.2)
+		return 4, 1
+	case 3: // Port Unreachable → Destination Unreachable, Port unreachable
+		return 1, 4
+	case 4: // Fragmentation Needed → Packet Too Big (type 2, code 0; handled separately)
+		return 0, 0
+	case 5: // Source Route Failed → Destination Unreachable, Source address failed
+		return 1, 5
+	case 6, 7: // Destination network/host unknown → Destination Unreachable, No route
+		return 1, 0
+	case 9, 10: // Administratively prohibited → Destination Unreachable, Administratively prohibited
+		return 1, 1
 	case 13: // Communication Administratively Prohibited
-		return 1
+		return 1, 1
 	default:
-		return 0
+		return 0, 0
 	}
 }
 

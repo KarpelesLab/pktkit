@@ -42,7 +42,9 @@ func (tc *TCPConn) SetReadDeadline(t time.Time) error  { return tc.vc.SetReadDea
 func (tc *TCPConn) SetWriteDeadline(t time.Time) error { return tc.vc.SetWriteDeadline(t) }
 
 func (tc *TCPConn) abort() {
-	tc.vc.Abort()
+	for _, pkt := range tc.vc.Abort() {
+		_ = tc.vc.Writer()(pkt)
+	}
 }
 
 // handleTCP dispatches incoming TCP segments to the appropriate connection.
@@ -123,9 +125,19 @@ func (c *Client) handleTCP(ip []byte, ihl int) error {
 	// Queue for Accept()
 	select {
 	case l.acceptCh <- tc:
+	case <-l.closeCh:
+		// Listener closed — abort and send RST
+		for _, pkt := range tc.vc.Abort() {
+			_ = vc.Writer()(pkt)
+		}
+		c.tcpMu.Lock()
+		delete(c.tcpConns, k)
+		c.tcpMu.Unlock()
 	default:
-		// Accept queue full — abort the connection and remove from map
-		tc.vc.Abort()
+		// Accept queue full — abort and send RST
+		for _, pkt := range tc.vc.Abort() {
+			_ = vc.Writer()(pkt)
+		}
 		c.tcpMu.Lock()
 		delete(c.tcpConns, k)
 		c.tcpMu.Unlock()
@@ -212,9 +224,19 @@ func (c *Client) handleTCP6(ip []byte) error {
 	// Queue for Accept()
 	select {
 	case l.acceptCh <- tc:
+	case <-l.closeCh:
+		// Listener closed — abort and send RST
+		for _, pkt := range tc.vc.Abort() {
+			_ = vc.Writer()(pkt)
+		}
+		c.tcpMu.Lock()
+		delete(c.tcpConns6, k)
+		c.tcpMu.Unlock()
 	default:
-		// Accept queue full — abort the connection and remove from map
-		tc.vc.Abort()
+		// Accept queue full — abort and send RST
+		for _, pkt := range tc.vc.Abort() {
+			_ = vc.Writer()(pkt)
+		}
 		c.tcpMu.Lock()
 		delete(c.tcpConns6, k)
 		c.tcpMu.Unlock()

@@ -63,8 +63,9 @@ type Client struct {
 	udpConns6 map[connKey6]*UDPConn6
 
 	// Ephemeral port allocation
-	portMu   sync.Mutex
-	nextPort uint16
+	portMu        sync.Mutex
+	nextPort      uint16
+	reservedPorts map[uint16]struct{} // ports allocated but not yet registered in conn maps
 
 	done   chan struct{}
 	closed atomic.Bool
@@ -74,13 +75,14 @@ type Client struct {
 // Use SetHandler to wire it for packet delivery before use.
 func New() *Client {
 	return &Client{
-		tcpConns:  make(map[connKey]*TCPConn),
-		tcpConns6: make(map[connKey6]*TCPConn),
-		listeners: make(map[uint16]*Listener),
-		udpConns:  make(map[connKey]*UDPConn),
-		udpConns6: make(map[connKey6]*UDPConn6),
-		nextPort:  49152,
-		done:      make(chan struct{}),
+		tcpConns:      make(map[connKey]*TCPConn),
+		tcpConns6:     make(map[connKey6]*TCPConn),
+		listeners:     make(map[uint16]*Listener),
+		udpConns:      make(map[connKey]*UDPConn),
+		udpConns6:     make(map[connKey6]*UDPConn6),
+		reservedPorts: make(map[uint16]struct{}),
+		nextPort:      49152,
+		done:          make(chan struct{}),
 	}
 }
 
@@ -248,21 +250,29 @@ func (c *Client) handleIPv4(ip []byte) error {
 }
 
 // allocPort returns the next ephemeral port, skipping ports already in use.
+// The port is reserved atomically so concurrent callers cannot get the same port.
+// Callers must call releasePort once the port is registered in a connection map.
 func (c *Client) allocPort() uint16 {
 	const minPort = 49152
 	const maxPort = 65535
 	const portRange = maxPort - minPort + 1
 
+	c.portMu.Lock()
+	defer c.portMu.Unlock()
+
 	for i := 0; i < portRange; i++ {
-		c.portMu.Lock()
 		p := c.nextPort
 		c.nextPort++
 		if c.nextPort == 0 || c.nextPort < minPort {
 			c.nextPort = minPort
 		}
-		c.portMu.Unlock()
 
-		// Check if port is in use in TCP connections (IPv4 + IPv6)
+		// Skip if already reserved by a concurrent allocPort call.
+		if _, reserved := c.reservedPorts[p]; reserved {
+			continue
+		}
+
+		// Check if port is in use in TCP connections (IPv4 + IPv6).
 		inUse := false
 		c.tcpMu.Lock()
 		for k := range c.tcpConns {
@@ -301,19 +311,27 @@ func (c *Client) allocPort() uint16 {
 		}
 
 		if !inUse {
+			c.reservedPorts[p] = struct{}{}
 			return p
 		}
 	}
 
 	// All ports exhausted; return the next candidate anyway as a fallback.
-	c.portMu.Lock()
 	p := c.nextPort
 	c.nextPort++
 	if c.nextPort == 0 || c.nextPort < minPort {
 		c.nextPort = minPort
 	}
-	c.portMu.Unlock()
+	c.reservedPorts[p] = struct{}{}
 	return p
+}
+
+// releasePort removes a port from the reserved set once it has been
+// registered in a connection map (or if the dial failed).
+func (c *Client) releasePort(port uint16) {
+	c.portMu.Lock()
+	delete(c.reservedPorts, port)
+	c.portMu.Unlock()
 }
 
 // sendPacket sends a raw IP packet via the handler.
