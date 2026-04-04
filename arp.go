@@ -96,9 +96,9 @@ func (q *arpPending) Drain(ip netip.Addr) []Packet {
 func buildARPPacket(op uint16, senderMAC net.HardwareAddr, senderIP netip.Addr, targetMAC net.HardwareAddr, targetIP netip.Addr) []byte {
 	buf := make([]byte, 28)
 	binary.BigEndian.PutUint16(buf[0:2], 1)      // hardware type: Ethernet
-	binary.BigEndian.PutUint16(buf[2:4], 0x0800)  // protocol type: IPv4
-	buf[4] = 6                                     // hardware addr len
-	buf[5] = 4                                     // protocol addr len
+	binary.BigEndian.PutUint16(buf[2:4], 0x0800) // protocol type: IPv4
+	buf[4] = 6                                   // hardware addr len
+	buf[5] = 4                                   // protocol addr len
 	binary.BigEndian.PutUint16(buf[6:8], op)
 	copy(buf[8:14], senderMAC)
 	s := senderIP.As4()

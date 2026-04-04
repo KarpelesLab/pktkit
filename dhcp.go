@@ -296,8 +296,8 @@ func (d *dhcpClient) sendDHCPFrame(dhcpPayload []byte) {
 	// UDP header (8 bytes)
 	udpLen := 8 + len(dhcpPayload)
 	udp := make([]byte, udpLen)
-	binary.BigEndian.PutUint16(udp[0:2], 68)            // src port
-	binary.BigEndian.PutUint16(udp[2:4], 67)            // dst port
+	binary.BigEndian.PutUint16(udp[0:2], 68)             // src port
+	binary.BigEndian.PutUint16(udp[2:4], 67)             // dst port
 	binary.BigEndian.PutUint16(udp[4:6], uint16(udpLen)) // length
 	// checksum = 0 (optional for IPv4 UDP)
 	copy(udp[8:], dhcpPayload)
@@ -305,10 +305,10 @@ func (d *dhcpClient) sendDHCPFrame(dhcpPayload []byte) {
 	// IPv4 header (20 bytes, no options)
 	ipLen := 20 + udpLen
 	ip := make([]byte, ipLen)
-	ip[0] = 0x45                                           // version=4, IHL=5
-	binary.BigEndian.PutUint16(ip[2:4], uint16(ipLen))     // total length
-	ip[8] = 64                                              // TTL
-	ip[9] = byte(ProtocolUDP)                               // protocol
+	ip[0] = 0x45                                       // version=4, IHL=5
+	binary.BigEndian.PutUint16(ip[2:4], uint16(ipLen)) // total length
+	ip[8] = 64                                         // TTL
+	ip[9] = byte(ProtocolUDP)                          // protocol
 	// src = 0.0.0.0, dst = 255.255.255.255
 	ip[16] = 0xff
 	ip[17] = 0xff
