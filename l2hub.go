@@ -75,13 +75,15 @@ func (h *L2Hub) forward(f Frame, sourceID uint64) {
 		return
 	}
 
-	// Learn source MAC → port mapping.
+	// Learn source MAC → port mapping (only if unknown or changed).
 	var srcMAC [6]byte
 	copy(srcMAC[:], f[6:12])
-	h.macTable.Store(srcMAC, macEntry{
-		portID:  sourceID,
-		expires: time.Now().Add(macAgingDuration).UnixNano(),
-	})
+	if v, ok := h.macTable.Load(srcMAC); !ok || v.(macEntry).portID != sourceID {
+		h.macTable.Store(srcMAC, macEntry{
+			portID:  sourceID,
+			expires: time.Now().Add(macAgingDuration).UnixNano(),
+		})
+	}
 
 	ports := h.ports.Load().([]l2Port)
 

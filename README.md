@@ -34,6 +34,7 @@ pktkit provides primitives for building virtual network topologies: devices, hub
 - **slirp**: NAT stack implementing L3Device — routes virtual traffic to the real network via `net.Dial`, supports IPv4/IPv6 TCP, UDP, and ICMPv6
 - **vclient**: virtual network client implementing L3Device — provides `Dial`, `Listen`, `net.Conn`, DNS resolution, and `http.Client`
 - **vtcp**: pure RFC-compliant TCP protocol engine (congestion control, SACK, timestamps, window scaling)
+- **nat**: IPv4 NAT between two virtual L3 networks with ALGs (FTP, SIP, H.323, PPTP, TFTP, IRC), NAT64, defragmentation, and UPnP
 
 ## Usage
 
@@ -86,6 +87,27 @@ adapter.StartDHCP()
 // Use standard Go HTTP client over the virtual network
 resp, _ := client.HTTPClient().Get("https://example.com")
 ```
+
+## Performance
+
+All data-plane hot paths are zero-allocation. Benchmarks on an i9-14900K (32 threads):
+
+| Path | ns/op | Throughput | Allocs |
+|------|------:|----------:|-------:|
+| Frame accessors | 0.68 | 2.2 TB/s | 0 |
+| Packet IPv4 accessors | 1.0 | 1.5 TB/s | 0 |
+| Packet IPv6 accessors | 0.59 | 2.5 TB/s | 0 |
+| L2Hub unicast forward | 57 | 26 GB/s | 0 |
+| L2Hub forward (parallel) | 3.2 | 472 GB/s | 0 |
+| L3Hub route | 10.7 | 140 GB/s | 0 |
+| L2Adapter incoming (frame to packet) | 38 | 40 GB/s | 0 |
+| L2Adapter outgoing (packet to frame, pooled) | 68 | 22 GB/s | 0 |
+| Checksum (1500 B) | 307 | 4.9 GB/s | 0 |
+| NAT outbound TCP (1440 B payload) | 292 | 4.9 GB/s | 1 |
+| SendBuf PeekUnsent | 0.28 | 5.3 TB/s | 0 |
+| ARP/NDP table lookup | 42 | - | 0 |
+
+Run benchmarks with `go test -bench=. -benchmem ./...`.
 
 ## License
 
