@@ -171,6 +171,62 @@ func BenchmarkEncryptDecrypt(b *testing.B) {
 	}
 }
 
+func BenchmarkEncryptTo(b *testing.B) {
+	for _, size := range []int{0, 64, 1420} {
+		b.Run(sizeLabel(size), func(b *testing.B) {
+			client, server, _, serverPub := setupHandshakePair(b)
+			defer client.Close()
+			defer server.Close()
+			doHandshake(b, client, server, serverPub)
+
+			payload := make([]byte, size)
+			dst := make([]byte, EncryptedSize(size))
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for b.Loop() {
+				_, err := client.EncryptTo(dst, payload, serverPub)
+				if err == ErrRekeyRequired {
+					continue
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkEncryptDecryptZeroAlloc(b *testing.B) {
+	for _, size := range []int{0, 64, 1420} {
+		b.Run(sizeLabel(size), func(b *testing.B) {
+			client, server, _, serverPub := setupHandshakePair(b)
+			defer client.Close()
+			defer server.Close()
+			doHandshake(b, client, server, serverPub)
+
+			payload := make([]byte, size)
+			dst := make([]byte, EncryptedSize(size))
+			addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
+
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for b.Loop() {
+				n, err := client.EncryptTo(dst, payload, serverPub)
+				if err == ErrRekeyRequired {
+					err = nil
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+				_, err = server.ProcessPacket(dst[:n], addr)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkReplayFilter(b *testing.B) {
 	b.Run("sequential", func(b *testing.B) {
 		var sw slidingWindow
