@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 
 	"github.com/KarpelesLab/pktkit"
 )
@@ -14,13 +15,20 @@ type AdapterConfig struct {
 	// PrivateKey is the local WireGuard identity. If zero, a new key is generated.
 	PrivateKey NoisePrivateKey
 
-	// Connector receives per-peer L2Devices. Use an [*pktkit.L2Hub] for shared
-	// networking or a [slirp.Provider] for per-peer namespace isolation.
-	Connector pktkit.L2Connector
+	// Connector wires each peer's L3Device to the network. Use a
+	// [slirp.Provider] for per-peer isolated NAT. Exactly one of
+	// Connector or L2Connector must be set.
+	Connector pktkit.L3Connector
 
-	// Addr is the IP prefix for the gateway side of each peer's link
-	// (e.g. "10.0.0.1/24"). Each peer's PipeL3 gets this prefix so the
-	// L2Adapter can respond to ARP for the gateway address.
+	// L2Connector wires each peer as an L2Device on a shared network.
+	// Use an [*pktkit.L2Hub] for a shared broadcast domain. When set,
+	// Addr must also be set for ARP resolution. Exactly one of
+	// Connector or L2Connector must be set.
+	L2Connector pktkit.L2Connector
+
+	// Addr is the IP prefix for the peer's L3Device. Required for
+	// L2Connector mode (used by the L2Adapter for ARP). Ignored in
+	// L3Connector mode.
 	Addr netip.Prefix
 
 	// OnUnknownPeer is called when an unauthorized peer initiates a handshake.
@@ -29,19 +37,23 @@ type AdapterConfig struct {
 	OnUnknownPeer func(key NoisePublicKey, addr *net.UDPAddr, packet []byte)
 }
 
-// Adapter bridges WireGuard peers to pktkit's L2 networking. Each peer that
-// completes a handshake gets a per-peer L3Device wrapped in an L2Adapter
-// and connected to the configured L2Connector (hub or namespace provider).
+// Adapter bridges WireGuard peers to pktkit networking. Each peer that
+// completes a handshake gets a per-peer L3Device connected to the
+// configured connector.
 //
-// Decrypted IP packets from peers are injected into their L3Device, which
-// the L2Adapter frames and forwards to the connector. Outgoing IP packets
-// from the connector flow back through the L2Adapter, are encrypted by the
-// WireGuard handler, and sent via the PacketConn.
+// With an [pktkit.L3Connector] (e.g. [slirp.Provider]): each peer gets
+// its own isolated NAT stack. Decrypted IP packets flow directly between
+// the WireGuard tunnel and the NAT engine — no L2 framing overhead.
+//
+// With an [pktkit.L2Connector] (e.g. [*pktkit.L2Hub]): each peer's
+// L3Device is wrapped in an L2Adapter for Ethernet framing on a shared
+// broadcast domain.
 type Adapter struct {
-	handler   *Handler
-	server    *Server
-	connector pktkit.L2Connector
-	addr      netip.Prefix
+	handler     *Handler
+	server      *Server
+	connector   pktkit.L3Connector
+	l2connector pktkit.L2Connector
+	addr        netip.Prefix
 
 	mu    sync.RWMutex
 	peers map[NoisePublicKey]*wgPeer
@@ -50,16 +62,63 @@ type Adapter struct {
 // wgPeer tracks one connected WireGuard peer's network plumbing.
 type wgPeer struct {
 	key     NoisePublicKey
-	pipe    *pktkit.PipeL3
-	adapter *pktkit.L2Adapter
-	cleanup func() error // from L2Connector.ConnectL2
+	dev     *peerL3Device
+	l2a     *pktkit.L2Adapter // non-nil only in L2 mode
+	cleanup func() error
 }
 
-// NewAdapter creates a WireGuard adapter that connects peers to the given
-// L2Connector. Call [Adapter.Serve] with a net.PacketConn to start.
+// peerL3Device is an L3Device representing one WireGuard peer on the
+// server side. It separates the two data directions:
+//
+//   - Send: called by the network (Stack or L2Adapter) to deliver a packet
+//     TO this peer → encrypts and sends via WireGuard.
+//   - handler: called when a packet arrives FROM this peer (decrypted) →
+//     delivers to the network (Stack or L2Adapter).
+type peerL3Device struct {
+	adapter *Adapter
+	key     NoisePublicKey
+	handler atomic.Pointer[func(pktkit.Packet) error]
+	addr    atomic.Value // netip.Prefix
+}
+
+// Send delivers a packet to this peer: encrypt and send via WireGuard.
+func (d *peerL3Device) Send(pkt pktkit.Packet) error {
+	return d.adapter.server.Send(pkt, d.key)
+}
+
+// SetHandler sets the callback for packets arriving from this peer.
+func (d *peerL3Device) SetHandler(h func(pktkit.Packet) error) {
+	d.handler.Store(&h)
+}
+
+// deliver forwards a decrypted packet from the peer to the network.
+func (d *peerL3Device) deliver(pkt pktkit.Packet) {
+	if h := d.handler.Load(); h != nil {
+		(*h)(pkt)
+	}
+}
+
+func (d *peerL3Device) Addr() netip.Prefix {
+	if v := d.addr.Load(); v != nil {
+		return v.(netip.Prefix)
+	}
+	return netip.Prefix{}
+}
+
+func (d *peerL3Device) SetAddr(p netip.Prefix) error {
+	d.addr.Store(p)
+	return nil
+}
+
+func (d *peerL3Device) Close() error { return nil }
+
+// NewAdapter creates a WireGuard adapter. Call [Adapter.Serve] to start.
 func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
-	if cfg.Connector == nil {
-		return nil, fmt.Errorf("wg: Connector is required")
+	if cfg.Connector == nil && cfg.L2Connector == nil {
+		return nil, fmt.Errorf("wg: either Connector or L2Connector is required")
+	}
+	if cfg.Connector != nil && cfg.L2Connector != nil {
+		return nil, fmt.Errorf("wg: Connector and L2Connector are mutually exclusive")
 	}
 
 	h, err := NewHandler(Config{
@@ -71,10 +130,11 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 	}
 
 	a := &Adapter{
-		handler:   h,
-		connector: cfg.Connector,
-		addr:      cfg.Addr,
-		peers:     make(map[NoisePublicKey]*wgPeer),
+		handler:     h,
+		connector:   cfg.Connector,
+		l2connector: cfg.L2Connector,
+		addr:        cfg.Addr,
+		peers:       make(map[NoisePublicKey]*wgPeer),
 	}
 
 	s, err := NewServer(ServerConfig{
@@ -148,7 +208,9 @@ func (a *Adapter) Close() error {
 	a.mu.Unlock()
 
 	for _, p := range peers {
-		p.adapter.Close()
+		if p.l2a != nil {
+			p.l2a.Close()
+		}
 		if p.cleanup != nil {
 			p.cleanup()
 		}
@@ -158,7 +220,6 @@ func (a *Adapter) Close() error {
 }
 
 // onPeerConnected is called by the Server when a handshake completes.
-// It creates the per-peer L3 pipe + L2Adapter and wires it to the connector.
 func (a *Adapter) onPeerConnected(key NoisePublicKey) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -168,27 +229,31 @@ func (a *Adapter) onPeerConnected(key NoisePublicKey) {
 		return
 	}
 
-	pipe := pktkit.NewPipeL3(a.addr)
+	dev := &peerL3Device{adapter: a, key: key}
+	dev.addr.Store(a.addr)
 
-	// Outgoing: packets from the network side → encrypt → send to peer.
-	pipe.SetHandler(func(pkt pktkit.Packet) error {
-		return a.server.Send(pkt, key)
-	})
+	peer := &wgPeer{key: key, dev: dev}
 
-	l2a := pktkit.NewL2Adapter(pipe, nil)
-
-	cleanup, err := a.connector.ConnectL2(l2a)
-	if err != nil {
-		l2a.Close()
-		return
+	if a.connector != nil {
+		// L3 mode: wire directly to the Stack (no L2 framing).
+		cleanup, err := a.connector.ConnectL3(dev)
+		if err != nil {
+			return
+		}
+		peer.cleanup = cleanup
+	} else {
+		// L2 mode: wrap in L2Adapter for Ethernet framing.
+		l2a := pktkit.NewL2Adapter(dev, nil)
+		cleanup, err := a.l2connector.ConnectL2(l2a)
+		if err != nil {
+			l2a.Close()
+			return
+		}
+		peer.l2a = l2a
+		peer.cleanup = cleanup
 	}
 
-	a.peers[key] = &wgPeer{
-		key:     key,
-		pipe:    pipe,
-		adapter: l2a,
-		cleanup: cleanup,
-	}
+	a.peers[key] = peer
 }
 
 // onPacket is called by the Server when a decrypted IP packet arrives.
@@ -201,8 +266,7 @@ func (a *Adapter) onPacket(data []byte, key NoisePublicKey) {
 		return
 	}
 
-	// Deliver the decrypted IP packet to the peer's L3 pipe.
-	p.pipe.Send(pktkit.Packet(data))
+	p.dev.deliver(pktkit.Packet(data))
 }
 
 // teardownPeer removes and cleans up a peer's network plumbing.
@@ -215,7 +279,9 @@ func (a *Adapter) teardownPeer(key NoisePublicKey) {
 	a.mu.Unlock()
 
 	if ok {
-		p.adapter.Close()
+		if p.l2a != nil {
+			p.l2a.Close()
+		}
 		if p.cleanup != nil {
 			p.cleanup()
 		}

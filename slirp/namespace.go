@@ -46,7 +46,9 @@ type slirpNamespace struct {
 func (ns *slirpNamespace) Device() pktkit.L2Device { return ns.adapter }
 
 func (ns *slirpNamespace) Close() error {
-	ns.adapter.Close()
+	if ns.adapter != nil {
+		ns.adapter.Close()
+	}
 	return ns.stack.Close()
 }
 
@@ -158,6 +160,31 @@ func (p *Provider) ConnectL2(dev pktkit.L2Device) (func() error, error) {
 	hub := pktkit.NewL2Hub()
 	hub.Connect(ns.Device())
 	hub.Connect(dev)
+
+	return func() error {
+		return p.Delete(name)
+	}, nil
+}
+
+// ConnectL3 implements [pktkit.L3Connector]. It creates a new isolated
+// NAT stack and wires the L3Device directly to it — no L2 framing overhead.
+// This is the natural connector for L3 tunnels like WireGuard.
+func (p *Provider) ConnectL3(dev pktkit.L3Device) (func() error, error) {
+	name := fmt.Sprintf("auto-%d", nsCounter.Add(1))
+
+	stack := New()
+	if p.config.Addr.IsValid() {
+		stack.SetAddr(p.config.Addr)
+	}
+
+	// Wire L3 bidirectionally: peer ↔ Stack.
+	pktkit.ConnectL3(stack, dev)
+
+	// Track the stack for cleanup. We store it as a slirpNamespace
+	// without an L2Adapter (adapter is nil).
+	p.mu.Lock()
+	p.namespaces[name] = &slirpNamespace{name: name, stack: stack}
+	p.mu.Unlock()
 
 	return func() error {
 		return p.Delete(name)

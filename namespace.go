@@ -16,6 +16,16 @@ type L2Connector interface {
 	ConnectL2(dev L2Device) (cleanup func() error, err error)
 }
 
+// L3Connector receives L3Devices and manages their attachment lifecycle.
+// This is the natural interface for protocols that operate at the IP layer
+// (e.g. WireGuard), avoiding unnecessary L2 framing overhead.
+//
+// Implementations:
+//   - [slirp.Provider]: each device gets an isolated NAT stack (cleanup deletes it)
+type L3Connector interface {
+	ConnectL3(dev L3Device) (cleanup func() error, err error)
+}
+
 // Serve runs an accept loop, connecting each accepted L2Device to the
 // connector. If the accepted device implements a Done() <-chan struct{}
 // method (e.g. [qemu.Conn]), cleanup is called automatically when the
