@@ -1,5 +1,3 @@
-//go:build !windows
-
 package pktkit_test
 
 import (
