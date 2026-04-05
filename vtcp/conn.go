@@ -424,6 +424,63 @@ func (c *Conn) AcceptSYN(syn Segment) [][]byte {
 	return c.drainOutgoing()
 }
 
+// AcceptCookie initializes a Conn directly into StateEstablished from a
+// validated SYN cookie handshake. Unlike AcceptSYN, this skips the
+// SYN-RECEIVED state since the three-way handshake already completed
+// (the SYN-ACK was sent statelessly via the cookie engine).
+//
+// Parameters:
+//   - remoteSeq: the remote's current sequence number (their ISN + 1)
+//   - ourISS: our initial sequence number (the cookie value)
+//   - mss: the negotiated MSS from the cookie
+//   - initialData: any data carried in the completing ACK (may be nil)
+//
+// Returns outgoing packets (an ACK confirming the connection).
+func (c *Conn) AcceptCookie(remoteSeq, ourISS uint32, mss uint16, initialData []byte) [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.state != StateClosed && c.state != StateListen {
+		return nil
+	}
+
+	if int(mss) < c.mss {
+		c.mss = int(mss)
+	}
+
+	// SYN cookie mode: no window scaling, SACK, or timestamps negotiated.
+	c.sendBuf = NewSendBuf(c.sendBufCap, ourISS+1) // SYN was ACKed → UNA = ISS+1
+	c.recvBuf = NewRecvBuf(remoteSeq, c.recvBufCap)
+
+	// Mark the SYN as both sent and acknowledged.
+	c.sendBuf.AdvanceSent(0) // NXT already at ISS+1
+
+	c.state = StateEstablished
+	c.safeCloseEstablished()
+
+	if c.keepalive {
+		c.startKeepalive()
+	}
+
+	// Buffer any data from the completing ACK.
+	if len(initialData) > 0 {
+		c.recvBuf.Insert(remoteSeq, initialData)
+	}
+
+	// Send an ACK to confirm we received their handshake completion.
+	ack := Segment{
+		SrcPort: c.localPort,
+		DstPort: c.remotePort,
+		Seq:     c.sendBuf.NXT(),
+		Ack:     c.recvBuf.Nxt(),
+		Flags:   FlagACK,
+		Window:  c.rcvWindow(),
+	}
+	c.queueSeg(ack)
+
+	return c.drainOutgoing()
+}
+
 func (c *Conn) negotiateOptions(remoteOpts []Option) {
 	// Window scaling: enabled if both sides offered WScale in their SYN.
 	// We always offer it unless NoWindowScaling was set (rcvWndShift stays 0

@@ -120,6 +120,20 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 		k := key6{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 		vc := s.virtTCP6[k]
 		if vc == nil {
+			// Use SYN cookies when the accept queue is nearly full.
+			if len(listener.acceptCh) >= cap(listener.acceptCh)-1 {
+				seg, err := vtcp.ParseSegment(tcp)
+				if err != nil {
+					s.mu.Unlock()
+					return err
+				}
+				s.mu.Unlock()
+				synack := s.syncookies.GenerateSYNACK(seg, dstPort, 1440)
+				pkt := buildPacket6(dstIP, srcIP, synack.Marshal())
+				_ = s.send(pkt)
+				return nil
+			}
+
 			seg, err := vtcp.ParseSegment(tcp)
 			if err != nil {
 				s.mu.Unlock()
@@ -208,7 +222,55 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 		return nil
 	}
 
-	// Non-SYN to non-existent → RST (RFC 9293 §3.10.7.1)
+	// Non-SYN: check if this ACK completes a SYN-cookie handshake.
+	if (flags&0x02) == 0 && (flags&0x10) != 0 {
+		cookieListener := s.listeners6[listenerKey6{ip: dstIP, port: dstPort}]
+		if cookieListener == nil {
+			cookieListener = s.listeners6[listenerKey6{port: dstPort}]
+		}
+		if cookieListener != nil {
+			seg, err := vtcp.ParseSegment(tcp)
+			if err == nil {
+				if mss, _, ok := s.syncookies.ValidateACK(seg, dstPort); ok {
+					localAddr := &net.TCPAddr{IP: net.IP(dstIP[:]), Port: int(dstPort)}
+					remoteAddr := &net.TCPAddr{IP: net.IP(srcIP[:]), Port: int(srcPort)}
+					vc := vtcp.NewConn(vtcp.ConnConfig{
+						LocalPort:  dstPort,
+						RemotePort: srcPort,
+						LocalAddr:  localAddr,
+						RemoteAddr: remoteAddr,
+						Writer: func(tcpSeg []byte) error {
+							return s.send(buildPacket6(dstIP, srcIP, tcpSeg))
+						},
+						MSS:       int(mss),
+						Keepalive: true,
+					})
+					pkts := vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload)
+					s.virtTCP6[k] = vc
+					s.mu.Unlock()
+					for _, pkt := range pkts {
+						_ = vc.Writer()(pkt)
+					}
+					select {
+					case cookieListener.acceptCh <- vc:
+					case <-cookieListener.closeCh:
+						vc.Abort()
+						s.mu.Lock()
+						delete(s.virtTCP6, k)
+						s.mu.Unlock()
+					default:
+						vc.Abort()
+						s.mu.Lock()
+						delete(s.virtTCP6, k)
+						s.mu.Unlock()
+					}
+					return nil
+				}
+			}
+		}
+	}
+
+	// RST for non-SYN to non-existent (RFC 9293 §3.10.7.1)
 	if (flags & 0x02) == 0 {
 		s.mu.Unlock()
 		var rstSeg *vtcp.Segment

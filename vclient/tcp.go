@@ -76,10 +76,25 @@ func (c *Client) handleTCP(ip []byte, ihl int) error {
 		return nil
 	}
 
-	// No existing connection — check for pure SYN to a listener
+	// No existing connection — check flags.
 	flags := tcp[13]
+
+	// Non-SYN: try SYN cookie validation before dropping.
 	if flags&(vtcp.FlagSYN|vtcp.FlagACK) != vtcp.FlagSYN {
-		return nil // not a pure SYN (reject SYN+ACK and non-SYN), drop
+		if (flags & vtcp.FlagACK) != 0 {
+			c.listenerMu.Lock()
+			l := c.listeners[dstPort]
+			c.listenerMu.Unlock()
+			if l != nil {
+				seg, err := vtcp.ParseSegment(tcp)
+				if err == nil {
+					if mss, _, ok := c.syncookies.ValidateACK(seg, dstPort); ok {
+						return c.acceptCookieConn4(seg, k, dstIP, srcIP, dstPort, srcPort, mss, l)
+					}
+				}
+			}
+		}
+		return nil
 	}
 
 	c.listenerMu.Lock()
@@ -94,7 +109,14 @@ func (c *Client) handleTCP(ip []byte, ihl int) error {
 		return nil
 	}
 
-	// Create a new vtcp.Conn for this incoming connection
+	// If the accept queue is nearly full, use SYN cookies.
+	if len(l.acceptCh) >= cap(l.acceptCh)-1 {
+		synack := c.syncookies.GenerateSYNACK(seg, dstPort, 1460)
+		pkt := buildIPv4Packet(dstIP, srcIP, synack.Marshal())
+		return c.sendPacket(pkt)
+	}
+
+	// Normal path: create a vtcp.Conn.
 	localAddr := &net.TCPAddr{IP: net.IP(dstIP[:]).To4(), Port: int(dstPort)}
 	remoteAddr := &net.TCPAddr{IP: net.IP(srcIP[:]).To4(), Port: int(srcPort)}
 
@@ -126,7 +148,6 @@ func (c *Client) handleTCP(ip []byte, ihl int) error {
 	select {
 	case l.acceptCh <- tc:
 	case <-l.closeCh:
-		// Listener closed — abort and send RST
 		for _, pkt := range tc.vc.Abort() {
 			_ = vc.Writer()(pkt)
 		}
@@ -134,7 +155,7 @@ func (c *Client) handleTCP(ip []byte, ihl int) error {
 		delete(c.tcpConns, k)
 		c.tcpMu.Unlock()
 	default:
-		// Accept queue full — abort and send RST
+		// Accept queue full — use SYN cookies for the next SYN instead.
 		for _, pkt := range tc.vc.Abort() {
 			_ = vc.Writer()(pkt)
 		}
@@ -175,17 +196,32 @@ func (c *Client) handleTCP6(ip []byte) error {
 		return nil
 	}
 
-	// No existing connection — check for pure SYN to a listener
+	// No existing connection — check flags.
 	flags := tcp[13]
+
+	// Non-SYN: try SYN cookie validation before dropping.
 	if flags&(vtcp.FlagSYN|vtcp.FlagACK) != vtcp.FlagSYN {
-		return nil // not a pure SYN, drop
+		if (flags & vtcp.FlagACK) != 0 {
+			c.listenerMu.Lock()
+			l := c.listeners[dstPort]
+			c.listenerMu.Unlock()
+			if l != nil {
+				seg, err := vtcp.ParseSegment(tcp)
+				if err == nil {
+					if mss, _, ok := c.syncookies.ValidateACK(seg, dstPort); ok {
+						return c.acceptCookieConn6(seg, k, dstIP, srcIP, dstPort, srcPort, mss, l)
+					}
+				}
+			}
+		}
+		return nil
 	}
 
 	c.listenerMu.Lock()
 	l := c.listeners[dstPort]
 	c.listenerMu.Unlock()
 	if l == nil {
-		return nil // no listener on this port
+		return nil
 	}
 
 	seg, err := vtcp.ParseSegment(tcp)
@@ -193,7 +229,14 @@ func (c *Client) handleTCP6(ip []byte) error {
 		return nil
 	}
 
-	// Create a new vtcp.Conn for this incoming IPv6 connection
+	// If the accept queue is nearly full, use SYN cookies.
+	if len(l.acceptCh) >= cap(l.acceptCh)-1 {
+		synack := c.syncookies.GenerateSYNACK(seg, dstPort, 1440)
+		pkt := buildIPv6Packet(dstIP, srcIP, synack.Marshal())
+		return c.sendPacket(pkt)
+	}
+
+	// Normal path: create a vtcp.Conn.
 	localAddr := &net.TCPAddr{IP: net.IP(dstIP[:]), Port: int(dstPort)}
 	remoteAddr := &net.TCPAddr{IP: net.IP(srcIP[:]), Port: int(srcPort)}
 
@@ -301,4 +344,86 @@ func buildIPv6Packet(srcIP, dstIP [16]byte, tcpSeg []byte) []byte {
 	copy(pkt, ipHdr)
 	copy(pkt[40:], tcpCopy)
 	return pkt
+}
+
+// acceptCookieConn4 creates a connection from a validated SYN cookie (IPv4).
+func (c *Client) acceptCookieConn4(seg vtcp.Segment, k connKey, dstIP, srcIP [4]byte, dstPort, srcPort, mss uint16, l *Listener) error {
+	localAddr := &net.TCPAddr{IP: net.IP(dstIP[:]).To4(), Port: int(dstPort)}
+	remoteAddr := &net.TCPAddr{IP: net.IP(srcIP[:]).To4(), Port: int(srcPort)}
+
+	vc := vtcp.NewConn(vtcp.ConnConfig{
+		LocalPort:  dstPort,
+		RemotePort: srcPort,
+		LocalAddr:  localAddr,
+		RemoteAddr: remoteAddr,
+		Writer: func(tcpSeg []byte) error {
+			return c.sendPacket(buildIPv4Packet(dstIP, srcIP, tcpSeg))
+		},
+		MSS:       int(mss),
+		Keepalive: true,
+	})
+
+	pkts := vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload)
+	tc := &TCPConn{vc: vc, c: c, k: k}
+
+	c.tcpMu.Lock()
+	c.tcpConns[k] = tc
+	c.tcpMu.Unlock()
+
+	for _, pkt := range pkts {
+		_ = vc.Writer()(pkt)
+	}
+
+	select {
+	case l.acceptCh <- tc:
+	case <-l.closeCh:
+		for _, pkt := range tc.vc.Abort() {
+			_ = vc.Writer()(pkt)
+		}
+		c.tcpMu.Lock()
+		delete(c.tcpConns, k)
+		c.tcpMu.Unlock()
+	}
+	return nil
+}
+
+// acceptCookieConn6 creates a connection from a validated SYN cookie (IPv6).
+func (c *Client) acceptCookieConn6(seg vtcp.Segment, k connKey6, dstIP, srcIP [16]byte, dstPort, srcPort, mss uint16, l *Listener) error {
+	localAddr := &net.TCPAddr{IP: net.IP(dstIP[:]), Port: int(dstPort)}
+	remoteAddr := &net.TCPAddr{IP: net.IP(srcIP[:]), Port: int(srcPort)}
+
+	vc := vtcp.NewConn(vtcp.ConnConfig{
+		LocalPort:  dstPort,
+		RemotePort: srcPort,
+		LocalAddr:  localAddr,
+		RemoteAddr: remoteAddr,
+		Writer: func(tcpSeg []byte) error {
+			return c.sendPacket(buildIPv6Packet(dstIP, srcIP, tcpSeg))
+		},
+		MSS:       int(mss),
+		Keepalive: true,
+	})
+
+	pkts := vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload)
+	tc := &TCPConn{vc: vc, c: c, k6: k, v6: true}
+
+	c.tcpMu.Lock()
+	c.tcpConns6[k] = tc
+	c.tcpMu.Unlock()
+
+	for _, pkt := range pkts {
+		_ = vc.Writer()(pkt)
+	}
+
+	select {
+	case l.acceptCh <- tc:
+	case <-l.closeCh:
+		for _, pkt := range tc.vc.Abort() {
+			_ = vc.Writer()(pkt)
+		}
+		c.tcpMu.Lock()
+		delete(c.tcpConns6, k)
+		c.tcpMu.Unlock()
+	}
+	return nil
 }

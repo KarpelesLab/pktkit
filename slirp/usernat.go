@@ -39,6 +39,7 @@ type Stack struct {
 	virtTCP6   map[key6]*vtcp.Conn
 	pending    map[key]struct{}
 	pending6   map[key6]struct{}
+	syncookies *vtcp.SYNCookies
 	done       chan struct{}
 	closeOnce  sync.Once
 }
@@ -55,6 +56,7 @@ func New() *Stack {
 		virtTCP6:   make(map[key6]*vtcp.Conn),
 		pending:    make(map[key]struct{}),
 		pending6:   make(map[key6]struct{}),
+		syncookies: vtcp.NewSYNCookies(),
 		done:       make(chan struct{}),
 	}
 	go s.maintenance()
@@ -198,7 +200,22 @@ func (s *Stack) handleIPv4(ip []byte) error {
 			k := key{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 			vc := s.virtTCP[k]
 			if vc == nil {
-				// Parse the TCP segment and create a vtcp.Conn
+				// If the accept queue is nearly full, use SYN cookies to avoid
+				// allocating state until the handshake completes.
+				if len(listener.acceptCh) >= cap(listener.acceptCh)-1 {
+					seg, err := vtcp.ParseSegment(tcp)
+					if err != nil {
+						s.mu.Unlock()
+						return err
+					}
+					s.mu.Unlock()
+					synack := s.syncookies.GenerateSYNACK(seg, dstPort, 1460)
+					pkt := buildPacket4(dstIP, srcIP, synack.Marshal())
+					_ = s.send(pkt)
+					return nil
+				}
+
+				// Normal path: create a vtcp.Conn.
 				seg, err := vtcp.ParseSegment(tcp)
 				if err != nil {
 					s.mu.Unlock()
@@ -288,7 +305,56 @@ func (s *Stack) handleIPv4(ip []byte) error {
 			return nil
 		}
 
-		// Non-SYN to non-existent connection → RST (RFC 9293 §3.10.7.1)
+		// Non-SYN to non-existent connection.
+		// First check if this ACK completes a SYN-cookie handshake.
+		if (flags&0x02) == 0 && (flags&0x10) != 0 {
+			cookieListener := s.listeners[listenerKey{ip: dstIP, port: dstPort}]
+			if cookieListener == nil {
+				cookieListener = s.listeners[listenerKey{port: dstPort}]
+			}
+			if cookieListener != nil {
+				seg, err := vtcp.ParseSegment(tcp)
+				if err == nil {
+					if mss, _, ok := s.syncookies.ValidateACK(seg, dstPort); ok {
+						localAddr := &net.TCPAddr{IP: net.IP(dstIP[:]).To4(), Port: int(dstPort)}
+						remoteAddr := &net.TCPAddr{IP: net.IP(srcIP[:]).To4(), Port: int(srcPort)}
+						vc := vtcp.NewConn(vtcp.ConnConfig{
+							LocalPort:  dstPort,
+							RemotePort: srcPort,
+							LocalAddr:  localAddr,
+							RemoteAddr: remoteAddr,
+							Writer: func(tcpSeg []byte) error {
+								return s.send(buildPacket4(dstIP, srcIP, tcpSeg))
+							},
+							MSS:       int(mss),
+							Keepalive: true,
+						})
+						pkts := vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload)
+						s.virtTCP[k] = vc
+						s.mu.Unlock()
+						for _, pkt := range pkts {
+							_ = vc.Writer()(pkt)
+						}
+						select {
+						case cookieListener.acceptCh <- vc:
+						case <-cookieListener.closeCh:
+							vc.Abort()
+							s.mu.Lock()
+							delete(s.virtTCP, k)
+							s.mu.Unlock()
+						default:
+							vc.Abort()
+							s.mu.Lock()
+							delete(s.virtTCP, k)
+							s.mu.Unlock()
+						}
+						return nil
+					}
+				}
+			}
+		}
+
+		// RST for non-SYN to non-existent connection (RFC 9293 §3.10.7.1)
 		if (flags & 0x02) == 0 {
 			s.mu.Unlock()
 			var rstSeg *vtcp.Segment

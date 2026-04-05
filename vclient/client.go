@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 
 	"github.com/KarpelesLab/pktkit"
+	"github.com/KarpelesLab/pktkit/vtcp"
 )
 
 // connKey identifies a connection by local port + remote endpoint (IPv4).
@@ -62,6 +63,9 @@ type Client struct {
 	// UDP connections (IPv6)
 	udpConns6 map[connKey6]*UDPConn6
 
+	// SYN cookie engine for SYN flood protection
+	syncookies *vtcp.SYNCookies
+
 	// Ephemeral port allocation
 	portMu        sync.Mutex
 	nextPort      uint16
@@ -80,6 +84,7 @@ func New() *Client {
 		listeners:     make(map[uint16]*Listener),
 		udpConns:      make(map[connKey]*UDPConn),
 		udpConns6:     make(map[connKey6]*UDPConn6),
+		syncookies:    vtcp.NewSYNCookies(),
 		reservedPorts: make(map[uint16]struct{}),
 		nextPort:      49152,
 		done:          make(chan struct{}),
