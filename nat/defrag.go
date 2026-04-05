@@ -15,16 +15,16 @@ const (
 )
 
 type fragKey struct {
-	srcIP  [4]byte
-	dstIP  [4]byte
-	id     uint16
-	proto  uint8
+	srcIP [4]byte
+	dstIP [4]byte
+	id    uint16
+	proto uint8
 }
 
 type fragEntry struct {
 	frags   []fragData
 	created time.Time
-	total   int  // total length if last fragment seen, else -1
+	total   int // total length if last fragment seen, else -1
 }
 
 type fragData struct {
@@ -78,7 +78,7 @@ func (d *Defragger) Process(pkt pktkit.Packet) pktkit.Packet {
 
 	// Check fragment flags and offset.
 	flagsOff := binary.BigEndian.Uint16(pkt[6:8])
-	mf := flagsOff&0x2000 != 0      // More Fragments flag
+	mf := flagsOff&0x2000 != 0             // More Fragments flag
 	fragOffset := int(flagsOff&0x1FFF) * 8 // fragment offset in bytes
 
 	// Not fragmented — pass through.

@@ -25,11 +25,11 @@ func TestICMPv4EchoRequest(t *testing.T) {
 	srcIP := [4]byte{10, 0, 0, 2}
 	dstIP := [4]byte{10, 0, 0, 1}
 
-	pkt := make([]byte, 28) // 20 IP + 8 ICMP
-	pkt[0] = 0x45           // IPv4, IHL=5
+	pkt := make([]byte, 28)                  // 20 IP + 8 ICMP
+	pkt[0] = 0x45                            // IPv4, IHL=5
 	binary.BigEndian.PutUint16(pkt[2:4], 28) // total length
-	pkt[8] = 64  // TTL
-	pkt[9] = 1   // protocol: ICMP
+	pkt[8] = 64                              // TTL
+	pkt[9] = 1                               // protocol: ICMP
 	copy(pkt[12:16], srcIP[:])
 	copy(pkt[16:20], dstIP[:])
 
@@ -38,10 +38,10 @@ func TestICMPv4EchoRequest(t *testing.T) {
 
 	// ICMP echo request.
 	icmp := pkt[20:]
-	icmp[0] = 8 // type: echo request
-	icmp[1] = 0 // code
+	icmp[0] = 8                                   // type: echo request
+	icmp[1] = 0                                   // code
 	binary.BigEndian.PutUint16(icmp[4:6], 0x1234) // identifier
-	binary.BigEndian.PutUint16(icmp[6:8], 1)       // sequence
+	binary.BigEndian.PutUint16(icmp[6:8], 1)      // sequence
 	binary.BigEndian.PutUint16(icmp[2:4], icmpChecksum(icmp))
 
 	if err := s.Send(pkt); err != nil {

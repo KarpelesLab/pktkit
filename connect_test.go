@@ -48,9 +48,9 @@ func (r *l3Recorder) Send(pkt Packet) error {
 	return nil
 }
 
-func (r *l3Recorder) Addr() netip.Prefix             { return r.prefix }
-func (r *l3Recorder) SetAddr(p netip.Prefix) error    { r.prefix = p; return nil }
-func (r *l3Recorder) Close() error                    { return nil }
+func (r *l3Recorder) Addr() netip.Prefix           { return r.prefix }
+func (r *l3Recorder) SetAddr(p netip.Prefix) error { r.prefix = p; return nil }
+func (r *l3Recorder) Close() error                 { return nil }
 
 // ---------- ConnectL2 tests ----------
 

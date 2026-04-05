@@ -295,7 +295,7 @@ func (n *NAT64) handleOutboundTCPUDP(transport []byte, proto uint8, srcIPv6 neti
 	// out[4:6] = 0 // identification
 	// out[6:8] = 0 // flags + fragment offset
 	out[8] = hopLimit // TTL
-	out[9] = proto     // protocol
+	out[9] = proto    // protocol
 	// out[10:12] = 0 // header checksum (computed below)
 	srcV4 := outsideIP.As4()
 	dstV4 := dstIPv4.As4()
@@ -340,7 +340,7 @@ func (n *NAT64) handleOutboundICMPv6(icmpData []byte, srcIPv6 netip.Addr, dstIPv
 	switch icmpType {
 	case 128: // ICMPv6 Echo Request → ICMPv4 Echo Request (type 8)
 		n.handleOutboundEchoRequest(icmpData, srcIPv6, dstIPv4, hopLimit)
-	// Other ICMPv6 types are not translated outbound in a NAT64.
+		// Other ICMPv6 types are not translated outbound in a NAT64.
 	}
 }
 

@@ -25,9 +25,9 @@ func (r *recorder) Send(pkt pktkit.Packet) error {
 	r.mu.Unlock()
 	return nil
 }
-func (r *recorder) Addr() netip.Prefix            { return r.addr }
-func (r *recorder) SetAddr(p netip.Prefix) error   { r.addr = p; return nil }
-func (r *recorder) Close() error                   { return nil }
+func (r *recorder) Addr() netip.Prefix           { return r.addr }
+func (r *recorder) SetAddr(p netip.Prefix) error { r.addr = p; return nil }
+func (r *recorder) Close() error                 { return nil }
 
 func (r *recorder) count() int {
 	r.mu.Lock()
@@ -148,7 +148,7 @@ func makeICMPUnreachable(srcIP, dstIP netip.Addr, code byte, trigger pktkit.Pack
 	copy(pkt[16:20], d[:])
 	binary.BigEndian.PutUint16(pkt[10:12], pktkit.Checksum(pkt[:20]))
 	// ICMP
-	pkt[ihl] = 3    // Destination Unreachable
+	pkt[ihl] = 3 // Destination Unreachable
 	pkt[ihl+1] = code
 	copy(pkt[ihl+8:], trigger[:embLen])
 	binary.BigEndian.PutUint16(pkt[ihl+2:ihl+4], 0)

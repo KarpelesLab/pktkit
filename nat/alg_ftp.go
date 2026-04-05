@@ -22,8 +22,8 @@ type FTPHelper struct{}
 // NewFTPHelper returns a new FTP ALG helper.
 func NewFTPHelper() *FTPHelper { return &FTPHelper{} }
 
-func (h *FTPHelper) Name() string  { return "ftp" }
-func (h *FTPHelper) Close() error  { return nil }
+func (h *FTPHelper) Name() string { return "ftp" }
+func (h *FTPHelper) Close() error { return nil }
 
 // MatchOutbound returns true for TCP connections to port 21 (FTP control).
 func (h *FTPHelper) MatchOutbound(proto uint8, dstPort uint16) bool {

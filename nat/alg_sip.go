@@ -27,8 +27,8 @@ func NewSIPHelper() *SIPHelper {
 	return &SIPHelper{}
 }
 
-func (h *SIPHelper) Name() string  { return "sip" }
-func (h *SIPHelper) Close() error  { return nil }
+func (h *SIPHelper) Name() string { return "sip" }
+func (h *SIPHelper) Close() error { return nil }
 
 // MatchOutbound returns true for UDP or TCP traffic to port 5060.
 func (h *SIPHelper) MatchOutbound(proto uint8, dstPort uint16) bool {

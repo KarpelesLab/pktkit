@@ -35,8 +35,8 @@ func NewIRCHelper(ports ...uint16) *IRCHelper {
 	return h
 }
 
-func (h *IRCHelper) Name() string  { return "irc" }
-func (h *IRCHelper) Close() error  { return nil }
+func (h *IRCHelper) Name() string { return "irc" }
+func (h *IRCHelper) Close() error { return nil }
 
 // MatchOutbound returns true for TCP connections to any of the configured
 // IRC ports.

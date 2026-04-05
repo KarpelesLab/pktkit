@@ -38,7 +38,6 @@ func (n *tcpNATConn) startBridge() {
 	}()
 }
 
-
 // close shuts down both connections. Safe to call from multiple goroutines.
 func (n *tcpNATConn) close() {
 	n.closeOnce.Do(func() {

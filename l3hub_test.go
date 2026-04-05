@@ -28,9 +28,9 @@ func (s *l3Spy) Send(pkt Packet) error {
 	s.mu.Unlock()
 	return nil
 }
-func (s *l3Spy) Addr() netip.Prefix         { return s.prefix }
+func (s *l3Spy) Addr() netip.Prefix           { return s.prefix }
 func (s *l3Spy) SetAddr(p netip.Prefix) error { s.prefix = p; return nil }
-func (s *l3Spy) Close() error               { return nil }
+func (s *l3Spy) Close() error                 { return nil }
 
 func (s *l3Spy) inject(pkt Packet) {
 	if s.handler != nil {
@@ -46,11 +46,11 @@ func (s *l3Spy) count() int {
 
 // makeTestIPv4 builds a minimal valid IPv4 packet with the given src/dst.
 func makeTestIPv4(src, dst netip.Addr) Packet {
-	pkt := make(Packet, 24) // 20-byte header + 4 payload
-	pkt[0] = 0x45           // version=4, IHL=5
+	pkt := make(Packet, 24)                  // 20-byte header + 4 payload
+	pkt[0] = 0x45                            // version=4, IHL=5
 	binary.BigEndian.PutUint16(pkt[2:4], 24) // total length
-	pkt[8] = 64  // TTL
-	pkt[9] = 6   // TCP
+	pkt[8] = 64                              // TTL
+	pkt[9] = 6                               // TCP
 	s := src.As4()
 	d := dst.As4()
 	copy(pkt[12:16], s[:])

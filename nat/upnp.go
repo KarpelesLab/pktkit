@@ -19,11 +19,11 @@ import (
 
 // UPnPConfig configures the UPnP IGD helper.
 type UPnPConfig struct {
-	ControlPort   uint16          // TCP port for the SOAP control server (default 5000)
-	AllowedPorts  [][2]uint16     // allowed outside port ranges; empty means all
-	MaxMappings   int             // max total port forwards (0 = unlimited)
-	MaxPerClient  int             // max port forwards per inside IP (0 = unlimited)
-	LeaseDuration time.Duration   // max lease duration (0 = permanent allowed)
+	ControlPort   uint16        // TCP port for the SOAP control server (default 5000)
+	AllowedPorts  [][2]uint16   // allowed outside port ranges; empty means all
+	MaxMappings   int           // max total port forwards (0 = unlimited)
+	MaxPerClient  int           // max port forwards per inside IP (0 = unlimited)
+	LeaseDuration time.Duration // max lease duration (0 = permanent allowed)
 }
 
 // EnableUPnP creates and registers a UPnP IGD helper on this NAT.
@@ -225,8 +225,8 @@ func (h *upnpHelper) sendSSDPResponse(n *NAT, dstIP netip.Addr, dstPort uint16) 
 	binary.BigEndian.PutUint16(pkt[10:12], pktkit.Checksum(pkt[:20]))
 
 	// UDP header.
-	binary.BigEndian.PutUint16(pkt[20:22], 1900)        // src port
-	binary.BigEndian.PutUint16(pkt[22:24], dstPort)     // dst port
+	binary.BigEndian.PutUint16(pkt[20:22], 1900)    // src port
+	binary.BigEndian.PutUint16(pkt[22:24], dstPort) // dst port
 	binary.BigEndian.PutUint16(pkt[24:26], uint16(udpLen))
 	copy(pkt[28:], respBytes)
 	// UDP checksum (optional in IPv4, set to 0).
@@ -336,15 +336,15 @@ type soapBody struct {
 }
 
 type addPortMappingRequest struct {
-	XMLName                 xml.Name `xml:"AddPortMapping"`
-	NewRemoteHost           string   `xml:"NewRemoteHost"`
-	NewExternalPort         uint16   `xml:"NewExternalPort"`
-	NewProtocol             string   `xml:"NewProtocol"`
-	NewInternalPort         uint16   `xml:"NewInternalPort"`
-	NewInternalClient       string   `xml:"NewInternalClient"`
-	NewEnabled              int      `xml:"NewEnabled"`
-	NewPortMappingDescription string `xml:"NewPortMappingDescription"`
-	NewLeaseDuration        uint32   `xml:"NewLeaseDuration"`
+	XMLName                   xml.Name `xml:"AddPortMapping"`
+	NewRemoteHost             string   `xml:"NewRemoteHost"`
+	NewExternalPort           uint16   `xml:"NewExternalPort"`
+	NewProtocol               string   `xml:"NewProtocol"`
+	NewInternalPort           uint16   `xml:"NewInternalPort"`
+	NewInternalClient         string   `xml:"NewInternalClient"`
+	NewEnabled                int      `xml:"NewEnabled"`
+	NewPortMappingDescription string   `xml:"NewPortMappingDescription"`
+	NewLeaseDuration          uint32   `xml:"NewLeaseDuration"`
 }
 
 type deletePortMappingRequest struct {
@@ -355,8 +355,8 @@ type deletePortMappingRequest struct {
 }
 
 type getGenericRequest struct {
-	XMLName              xml.Name `xml:"GetGenericPortMappingEntry"`
-	NewPortMappingIndex  int      `xml:"NewPortMappingIndex"`
+	XMLName             xml.Name `xml:"GetGenericPortMappingEntry"`
+	NewPortMappingIndex int      `xml:"NewPortMappingIndex"`
 }
 
 type getSpecificRequest struct {

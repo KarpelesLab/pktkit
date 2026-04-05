@@ -30,8 +30,8 @@ func NewH323Helper() *H323Helper {
 	return &H323Helper{}
 }
 
-func (h *H323Helper) Name() string  { return "h323" }
-func (h *H323Helper) Close() error  { return nil }
+func (h *H323Helper) Name() string { return "h323" }
+func (h *H323Helper) Close() error { return nil }
 
 // MatchOutbound returns true for TCP traffic to port 1720 (Q.931/H.225).
 func (h *H323Helper) MatchOutbound(proto uint8, dstPort uint16) bool {

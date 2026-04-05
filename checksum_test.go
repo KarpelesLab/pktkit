@@ -15,13 +15,13 @@ func TestChecksum_ValidIPv4Header(t *testing.T) {
 	// Header: Version=4, IHL=5, TotalLen=40, TTL=64, Proto=TCP(6)
 	// Src=192.168.1.1, Dst=10.0.0.1
 	hdr := make([]byte, 20)
-	hdr[0] = 0x45             // Version=4, IHL=5
-	hdr[1] = 0x00             // DSCP/ECN
-	binary.BigEndian.PutUint16(hdr[2:4], 40)   // Total Length
+	hdr[0] = 0x45                                // Version=4, IHL=5
+	hdr[1] = 0x00                                // DSCP/ECN
+	binary.BigEndian.PutUint16(hdr[2:4], 40)     // Total Length
 	binary.BigEndian.PutUint16(hdr[4:6], 0x1234) // Identification
 	binary.BigEndian.PutUint16(hdr[6:8], 0x0000) // Flags+FragOffset
-	hdr[8] = 64               // TTL
-	hdr[9] = 6                // Protocol = TCP
+	hdr[8] = 64                                  // TTL
+	hdr[9] = 6                                   // Protocol = TCP
 	// Leave checksum at [10:12] as zero for now
 	copy(hdr[12:16], []byte{192, 168, 1, 1}) // Src
 	copy(hdr[16:20], []byte{10, 0, 0, 1})    // Dst

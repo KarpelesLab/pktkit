@@ -13,11 +13,11 @@ import (
 // It wraps a vtcp.Conn and handles registration/unregistration
 // with the parent Client.
 type TCPConn struct {
-	vc  *vtcp.Conn
-	c   *Client
-	k   connKey
-	k6  connKey6
-	v6  bool // true when this connection uses IPv6
+	vc *vtcp.Conn
+	c  *Client
+	k  connKey
+	k6 connKey6
+	v6 bool // true when this connection uses IPv6
 }
 
 func (tc *TCPConn) Read(b []byte) (int, error)  { return tc.vc.Read(b) }

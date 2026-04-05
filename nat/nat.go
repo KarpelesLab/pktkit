@@ -33,6 +33,7 @@ const (
 )
 
 type natKey struct {
+	ns    uint64 // namespace ID (0 = legacy single-device Inside())
 	proto uint8
 	ip    netip.Addr
 	port  uint16 // src port for TCP/UDP, identifier for ICMP
@@ -54,6 +55,10 @@ type natMapping struct {
 // NAT performs IPv4 network address translation between two L3 networks.
 // Inside() faces the private network (acts as default gateway).
 // Outside() faces the upstream network (uses a public IP).
+//
+// For multi-tenant use (e.g. WireGuard), call ConnectL3 to create
+// namespace-isolated inside L3Devices. Each namespace's connections are
+// tracked independently, allowing overlapping inside IPs.
 type NAT struct {
 	inside  natSide
 	outside natSide
@@ -67,6 +72,11 @@ type NAT struct {
 	expectations []Expectation
 	defragger    atomic.Pointer[Defragger]
 
+	// Namespace-aware inside sides (for ConnectL3).
+	nsMu      sync.RWMutex
+	nsSides   map[uint64]*natNsSide
+	nsCounter atomic.Uint64
+
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -77,6 +87,7 @@ func New(insideAddr, outsideAddr netip.Prefix) *NAT {
 		mappings: make(map[natKey]*natMapping),
 		reverse:  make(map[natRevKey]*natMapping),
 		nextPort: natPortMin,
+		nsSides:  make(map[uint64]*natNsSide),
 		done:     make(chan struct{}),
 	}
 	n.inside.nat = n
@@ -129,7 +140,7 @@ func (s *natSide) Send(pkt pktkit.Packet) error {
 		return nil
 	}
 	if s.isInside {
-		s.nat.handleOutbound(pkt)
+		s.nat.handleOutbound(0, pkt)
 	} else {
 		s.nat.handleInbound(pkt)
 	}
@@ -162,9 +173,102 @@ func (n *NAT) SendInside(pkt pktkit.Packet) {
 	n.inside.send(pkt)
 }
 
+// sendInside routes a packet to the correct inside device based on namespace.
+// ns=0 uses the legacy single Inside() device.
+func (n *NAT) sendInside(ns uint64, pkt pktkit.Packet) {
+	if ns == 0 {
+		n.inside.send(pkt)
+		return
+	}
+	n.nsMu.RLock()
+	side := n.nsSides[ns]
+	n.nsMu.RUnlock()
+	if side != nil {
+		side.send(pkt)
+	}
+}
+
+// --- Namespace-aware inside sides ---
+
+// natNsSide is a per-namespace inside L3Device created by ConnectL3.
+type natNsSide struct {
+	nat     *NAT
+	ns      uint64
+	handler atomic.Pointer[func(pktkit.Packet) error]
+	addr    atomic.Value // netip.Prefix
+}
+
+func (s *natNsSide) SetHandler(h func(pktkit.Packet) error) { s.handler.Store(&h) }
+
+func (s *natNsSide) Send(pkt pktkit.Packet) error {
+	if len(pkt) < 20 || pkt[0]>>4 != 4 {
+		return nil
+	}
+	s.nat.handleOutbound(s.ns, pkt)
+	return nil
+}
+
+func (s *natNsSide) Addr() netip.Prefix {
+	if v := s.addr.Load(); v != nil {
+		return v.(netip.Prefix)
+	}
+	return netip.Prefix{}
+}
+
+func (s *natNsSide) SetAddr(p netip.Prefix) error {
+	s.addr.Store(p)
+	return nil
+}
+
+func (s *natNsSide) Close() error { return nil }
+
+func (s *natNsSide) send(pkt pktkit.Packet) {
+	if h := s.handler.Load(); h != nil {
+		(*h)(pkt)
+	}
+}
+
+// ConnectL3 implements [pktkit.L3Connector]. It creates a namespace-isolated
+// inside L3Device. Packets from the device are tracked with a unique namespace
+// ID, so multiple devices can use overlapping inside IPs without conflict.
+// The returned cleanup function removes the namespace and its mappings.
+func (n *NAT) ConnectL3(dev pktkit.L3Device) (func() error, error) {
+	nsID := n.nsCounter.Add(1)
+
+	side := &natNsSide{nat: n, ns: nsID}
+	side.addr.Store(n.inside.Addr())
+
+	// Wire bidirectionally.
+	pktkit.ConnectL3(side, dev)
+
+	n.nsMu.Lock()
+	n.nsSides[nsID] = side
+	n.nsMu.Unlock()
+
+	return func() error {
+		n.nsMu.Lock()
+		delete(n.nsSides, nsID)
+		n.nsMu.Unlock()
+		n.cleanupNamespace(nsID)
+		return nil
+	}, nil
+}
+
+// cleanupNamespace removes all mappings belonging to a namespace.
+func (n *NAT) cleanupNamespace(ns uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for k, m := range n.mappings {
+		if k.ns == ns {
+			delete(n.mappings, k)
+			delete(n.reverse, natRevKey{proto: k.proto, port: m.outsidePort})
+		}
+	}
+}
+
 // --- Outbound: inside → outside ---
 
-func (n *NAT) handleOutbound(pkt pktkit.Packet) {
+func (n *NAT) handleOutbound(ns uint64, pkt pktkit.Packet) {
 	// Defragment if enabled (atomic load — no lock needed on the hot path).
 	if d := n.defragger.Load(); d != nil {
 		pkt = d.Process(pkt)
@@ -189,20 +293,20 @@ func (n *NAT) handleOutbound(pkt pktkit.Packet) {
 		if len(pkt) < ihl+4 {
 			return
 		}
-		n.handleOutboundTCPUDP(pkt, ihl, proto)
+		n.handleOutboundTCPUDP(ns, pkt, ihl, proto)
 	case protoICMP:
 		if len(pkt) < ihl+8 {
 			return
 		}
-		n.handleOutboundICMP(pkt, ihl)
+		n.handleOutboundICMP(ns, pkt, ihl)
 	}
 }
 
-func (n *NAT) handleOutboundTCPUDP(pkt pktkit.Packet, ihl int, proto uint8) {
+func (n *NAT) handleOutboundTCPUDP(ns uint64, pkt pktkit.Packet, ihl int, proto uint8) {
 	srcPort := binary.BigEndian.Uint16(pkt[ihl : ihl+2])
 	srcIP := netip.AddrFrom4([4]byte(pkt[12:16]))
 
-	k := natKey{proto: proto, ip: srcIP, port: srcPort}
+	k := natKey{ns: ns, proto: proto, ip: srcIP, port: srcPort}
 	m := n.getOrCreateMapping(k)
 	if m == nil {
 		return
@@ -251,7 +355,7 @@ func (n *NAT) handleOutboundTCPUDP(pkt pktkit.Packet, ihl int, proto uint8) {
 	n.outside.send(out)
 }
 
-func (n *NAT) handleOutboundICMP(pkt pktkit.Packet, ihl int) {
+func (n *NAT) handleOutboundICMP(ns uint64, pkt pktkit.Packet, ihl int) {
 	icmpType := pkt[ihl]
 	if icmpType != 8 { // only handle Echo Request outbound
 		return
@@ -260,7 +364,7 @@ func (n *NAT) handleOutboundICMP(pkt pktkit.Packet, ihl int) {
 	srcIP := netip.AddrFrom4([4]byte(pkt[12:16]))
 	id := binary.BigEndian.Uint16(pkt[ihl+4 : ihl+6])
 
-	k := natKey{proto: protoICMP, ip: srcIP, port: id}
+	k := natKey{ns: ns, proto: protoICMP, ip: srcIP, port: id}
 	m := n.getOrCreateMapping(k)
 	if m == nil {
 		return
@@ -398,7 +502,7 @@ func (n *NAT) handleInboundTCPUDP(pkt pktkit.Packet, ihl int, proto uint8) {
 	origDstPort := binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4]) // pre-NAT dst port
 	out = n.helperInbound(out, m, proto, origDstPort)
 
-	n.inside.send(out)
+	n.sendInside(m.key.ns, out)
 }
 
 func (n *NAT) handleInboundICMP(pkt pktkit.Packet, ihl int) {
@@ -431,7 +535,7 @@ func (n *NAT) handleInboundICMP(pkt pktkit.Packet, ihl int) {
 		updateIPChecksumDst(out, oldDstIP, newDstIP)
 		updateICMPChecksum(out, ihl, oldID, m.key.port)
 
-		n.inside.send(out)
+		n.sendInside(m.key.ns, out)
 
 	case 3, 11, 12: // Dest Unreachable, Time Exceeded, Parameter Problem
 		n.handleInboundICMPError(pkt, ihl)
@@ -501,7 +605,7 @@ func (n *NAT) handleInboundICMPError(pkt pktkit.Packet, outerIHL int) {
 	binary.BigEndian.PutUint16(icmpData[2:4], 0)
 	binary.BigEndian.PutUint16(icmpData[2:4], pktkit.Checksum(icmpData))
 
-	n.inside.send(out)
+	n.sendInside(m.key.ns, out)
 }
 
 // --- Mapping management ---

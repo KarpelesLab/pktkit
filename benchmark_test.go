@@ -18,8 +18,8 @@ func buildTestFrame() Frame {
 	// Minimal IPv4 header
 	payload[0] = 0x45 // version 4, IHL 5
 	binary.BigEndian.PutUint16(payload[2:4], 1500)
-	payload[8] = 64  // TTL
-	payload[9] = 6   // TCP
+	payload[8] = 64 // TTL
+	payload[9] = 6  // TCP
 	copy(payload[12:16], net.IPv4(10, 0, 0, 1).To4())
 	copy(payload[16:20], net.IPv4(10, 0, 0, 2).To4())
 	return NewFrame(dstMAC, srcMAC, EtherTypeIPv4, payload)

@@ -20,8 +20,8 @@ type TFTPHelper struct{}
 // NewTFTPHelper returns a new TFTP ALG helper.
 func NewTFTPHelper() *TFTPHelper { return &TFTPHelper{} }
 
-func (h *TFTPHelper) Name() string  { return "tftp" }
-func (h *TFTPHelper) Close() error  { return nil }
+func (h *TFTPHelper) Name() string { return "tftp" }
+func (h *TFTPHelper) Close() error { return nil }
 
 // MatchOutbound returns true for UDP connections to port 69 (TFTP).
 func (h *TFTPHelper) MatchOutbound(proto uint8, dstPort uint16) bool {

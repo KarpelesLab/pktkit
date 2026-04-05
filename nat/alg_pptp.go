@@ -10,9 +10,9 @@ import (
 )
 
 const (
-	pptpPort         = 1723
-	pptpMagicCookie  = 0x1A2B3C4D
-	pptpGRETimeout   = 120 * time.Second
+	pptpPort        = 1723
+	pptpMagicCookie = 0x1A2B3C4D
+	pptpGRETimeout  = 120 * time.Second
 
 	// PPTP control message types
 	pptpStartControlConnReq = 1

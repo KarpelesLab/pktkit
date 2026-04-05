@@ -174,7 +174,7 @@ func wrapICMPv6(src, dst netip.Addr, icmpPayload []byte) []byte {
 	ip := make([]byte, 40+len(icmpPayload))
 	ip[0] = 0x60 // version 6
 	binary.BigEndian.PutUint16(ip[4:6], uint16(len(icmpPayload)))
-	ip[6] = 58 // next header: ICMPv6
+	ip[6] = 58  // next header: ICMPv6
 	ip[7] = 255 // hop limit (NDP uses 255)
 	s := src.As16()
 	d := dst.As16()

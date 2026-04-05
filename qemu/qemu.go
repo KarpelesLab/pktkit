@@ -28,11 +28,11 @@ const maxFrameSize = 65535
 // Conn wraps a stream connection and implements [pktkit.L2Device].
 // Each Ethernet frame is length-prefixed with a 4-byte big-endian uint32.
 type Conn struct {
-	conn    net.Conn
-	mac     net.HardwareAddr
-	handler atomic.Pointer[func(pktkit.Frame) error]
-	writeMu sync.Mutex
-	done    chan struct{}
+	conn      net.Conn
+	mac       net.HardwareAddr
+	handler   atomic.Pointer[func(pktkit.Frame) error]
+	writeMu   sync.Mutex
+	done      chan struct{}
 	closeOnce sync.Once
 }
 

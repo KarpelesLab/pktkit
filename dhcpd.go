@@ -42,8 +42,8 @@ type DHCPServer struct {
 	handler atomic.Pointer[func(Frame) error]
 
 	mu       sync.Mutex
-	leases   map[[6]byte]*dhcpLease    // keyed by client MAC
-	declined map[netip.Addr]time.Time  // IPs declined by clients
+	leases   map[[6]byte]*dhcpLease   // keyed by client MAC
+	declined map[netip.Addr]time.Time // IPs declined by clients
 }
 
 // NewDHCPServer creates a new DHCP server with the given configuration.

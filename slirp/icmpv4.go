@@ -79,4 +79,3 @@ func ipv4HeaderChecksum(header []byte) uint16 {
 	}
 	return ^uint16(sum)
 }
-

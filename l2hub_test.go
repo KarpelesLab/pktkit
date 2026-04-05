@@ -43,7 +43,6 @@ func (s *l2Spy) count() int {
 	return len(s.received)
 }
 
-
 func TestL2Hub_Flood_UnknownUnicast(t *testing.T) {
 	hub := NewL2Hub()
 	a := newL2Spy(net.HardwareAddr{0x02, 0, 0, 0, 0, 1})
