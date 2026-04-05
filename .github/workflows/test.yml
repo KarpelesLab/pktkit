@@ -29,6 +29,7 @@ jobs:
         run: go build ./...
 
       - name: Test
+        shell: bash
         run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Upload coverage to Coveralls
