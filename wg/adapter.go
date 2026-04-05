@@ -13,7 +13,14 @@ import (
 // AdapterConfig configures a WireGuard [Adapter].
 type AdapterConfig struct {
 	// PrivateKey is the local WireGuard identity. If zero, a new key is generated.
+	// Ignored if MultiHandler is set.
 	PrivateKey NoisePrivateKey
+
+	// MultiHandler provides multiple WireGuard identities on a single port.
+	// When set, PrivateKey is ignored and the adapter operates in multi-key
+	// mode. Use [Adapter.AddPeerTo] and [Adapter.RemovePeerFrom] to manage
+	// peers per-identity, or [Adapter.AddPeer] to authorize on all identities.
+	MultiHandler *MultiHandler
 
 	// Connector wires each peer's L3Device to the network. Use a
 	// [slirp.Stack] or [nat.NAT] for per-peer namespace-isolated NAT.
@@ -49,11 +56,12 @@ type AdapterConfig struct {
 // L3Device is wrapped in an L2Adapter for Ethernet framing on a shared
 // broadcast domain.
 type Adapter struct {
-	handler     *Handler
-	server      *Server
-	connector   pktkit.L3Connector
-	l2connector pktkit.L2Connector
-	addr        netip.Prefix
+	handler      *Handler      // non-nil in single-key mode
+	multiHandler *MultiHandler // non-nil in multi-key mode
+	server       *Server
+	connector    pktkit.L3Connector
+	l2connector  pktkit.L2Connector
+	addr         netip.Prefix
 
 	mu    sync.RWMutex
 	peers map[NoisePublicKey]*wgPeer
@@ -121,31 +129,45 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 		return nil, fmt.Errorf("wg: Connector and L2Connector are mutually exclusive")
 	}
 
-	h, err := NewHandler(Config{
-		PrivateKey:    cfg.PrivateKey,
-		OnUnknownPeer: cfg.OnUnknownPeer,
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	a := &Adapter{
-		handler:     h,
 		connector:   cfg.Connector,
 		l2connector: cfg.L2Connector,
 		addr:        cfg.Addr,
 		peers:       make(map[NoisePublicKey]*wgPeer),
 	}
 
-	s, err := NewServer(ServerConfig{
-		Handler: h,
+	serverCfg := ServerConfig{
 		OnPacket: func(data []byte, peerKey NoisePublicKey, _ *Handler) {
 			a.onPacket(data, peerKey)
 		},
 		OnPeerConnected: func(peerKey NoisePublicKey, _ *Handler) {
 			a.onPeerConnected(peerKey)
 		},
-	})
+	}
+
+	if cfg.MultiHandler != nil {
+		a.multiHandler = cfg.MultiHandler
+		serverCfg.MultiHandler = cfg.MultiHandler
+
+		// Set OnUnknownPeer on all handlers if configured.
+		if cfg.OnUnknownPeer != nil {
+			for _, h := range cfg.MultiHandler.Handlers() {
+				h.onUnknownPeer = cfg.OnUnknownPeer
+			}
+		}
+	} else {
+		h, err := NewHandler(Config{
+			PrivateKey:    cfg.PrivateKey,
+			OnUnknownPeer: cfg.OnUnknownPeer,
+		})
+		if err != nil {
+			return nil, err
+		}
+		a.handler = h
+		serverCfg.Handler = h
+	}
+
+	s, err := NewServer(serverCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -156,46 +178,114 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 
 // Serve starts the WireGuard read loop on conn. Blocks until [Close] is called.
 func (a *Adapter) Serve(conn net.PacketConn) error {
-	a.handler.SetConn(conn)
+	if a.multiHandler != nil {
+		for _, h := range a.multiHandler.Handlers() {
+			h.SetConn(conn)
+		}
+	} else {
+		a.handler.SetConn(conn)
+	}
 	return a.server.Serve(conn)
 }
 
-// AddPeer authorizes a peer by public key.
+// AddPeer authorizes a peer by public key. In multi-key mode, the peer is
+// authorized on all handlers. Use [AddPeerTo] to target a specific identity.
 func (a *Adapter) AddPeer(key NoisePublicKey) {
+	if a.multiHandler != nil {
+		for _, h := range a.multiHandler.Handlers() {
+			h.AddPeer(key)
+		}
+		return
+	}
 	a.handler.AddPeer(key)
 }
 
-// AddPeerWithPSK authorizes a peer with a preshared key.
+// AddPeerTo authorizes a peer on a specific handler (multi-key mode).
+func (a *Adapter) AddPeerTo(key NoisePublicKey, handler *Handler) {
+	handler.AddPeer(key)
+}
+
+// AddPeerWithPSK authorizes a peer with a preshared key. In single-key mode
+// only; use [AddPeerTo] with handler.AddPeerWithPSK in multi-key mode.
 func (a *Adapter) AddPeerWithPSK(key NoisePublicKey, psk NoisePresharedKey) {
 	a.handler.AddPeerWithPSK(key, psk)
 }
 
 // AcceptUnknownPeer authorizes a previously unknown peer and completes
-// its handshake. The conn passed to [Serve] must be active.
+// its handshake. In multi-key mode, the correct handler is determined
+// automatically from the packet's MAC1.
 func (a *Adapter) AcceptUnknownPeer(key NoisePublicKey, packet []byte, addr *net.UDPAddr) error {
+	if a.multiHandler != nil {
+		// Find which handler the packet is for via MAC1 check.
+		for _, h := range a.multiHandler.Handlers() {
+			if h.cookieChecker.CheckMAC1(packet) {
+				return h.AcceptUnknownPeer(key, packet, addr)
+			}
+		}
+		return fmt.Errorf("wg: no handler matched MAC1 for unknown peer")
+	}
 	return a.handler.AcceptUnknownPeer(key, packet, addr)
 }
 
 // RemovePeer revokes a peer and tears down its network plumbing.
+// In multi-key mode, the peer is removed from all handlers.
 func (a *Adapter) RemovePeer(key NoisePublicKey) {
-	a.handler.RemovePeer(key)
+	if a.multiHandler != nil {
+		for _, h := range a.multiHandler.Handlers() {
+			h.RemovePeer(key)
+		}
+	} else {
+		a.handler.RemovePeer(key)
+	}
+	a.teardownPeer(key)
+}
+
+// RemovePeerFrom removes a peer from a specific handler and tears down
+// its network plumbing.
+func (a *Adapter) RemovePeerFrom(key NoisePublicKey, handler *Handler) {
+	handler.RemovePeer(key)
 	a.teardownPeer(key)
 }
 
 // Connect initiates a handshake to a peer at the given address.
-// The peer must be authorized first via [AddPeer].
+// The peer must be authorized first via [AddPeer]. In single-key mode only;
+// use [ConnectWith] in multi-key mode.
 func (a *Adapter) Connect(key NoisePublicKey, addr *net.UDPAddr) error {
 	return a.server.Connect(key, addr)
 }
 
-// PublicKey returns the adapter's WireGuard public key.
+// ConnectWith initiates a handshake to a peer using a specific handler.
+func (a *Adapter) ConnectWith(key NoisePublicKey, addr *net.UDPAddr, handler *Handler) error {
+	return a.server.ConnectWith(key, addr, handler)
+}
+
+// PublicKey returns the adapter's WireGuard public key (single-key mode only).
+// In multi-key mode, use [Handlers] to access individual public keys.
 func (a *Adapter) PublicKey() NoisePublicKey {
+	if a.handler == nil {
+		panic("wg: PublicKey() not available in multi-key mode; use Handlers()")
+	}
 	return a.handler.PublicKey()
 }
 
-// Handler returns the underlying WireGuard protocol handler.
+// Handler returns the underlying WireGuard protocol handler (single-key mode).
+// Returns nil in multi-key mode.
 func (a *Adapter) Handler() *Handler {
 	return a.handler
+}
+
+// MultiHandler returns the multi-key handler, or nil in single-key mode.
+func (a *Adapter) MultiHandler() *MultiHandler {
+	return a.multiHandler
+}
+
+// Handlers returns all handlers. In single-key mode, returns a slice with
+// the single handler. In multi-key mode, returns all handlers.
+func (a *Adapter) Handlers() []*Handler {
+	if a.multiHandler != nil {
+		return a.multiHandler.Handlers()
+	}
+	return []*Handler{a.handler}
 }
 
 // Close stops the adapter and tears down all peer connections.
@@ -216,6 +306,9 @@ func (a *Adapter) Close() error {
 		}
 	}
 
+	if a.multiHandler != nil {
+		return a.multiHandler.Close()
+	}
 	return a.handler.Close()
 }
 

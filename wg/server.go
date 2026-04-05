@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -36,6 +37,12 @@ type ServerConfig struct {
 
 	// ReadBufferSize is the size of the UDP read buffer. Default: 2048.
 	ReadBufferSize int
+
+	// Concurrency is the number of goroutines reading from the PacketConn
+	// in parallel. Each goroutine has its own buffer and calls ReadFrom
+	// independently; the kernel distributes packets across readers.
+	// Default: 0 (uses runtime.NumCPU()).
+	Concurrency int
 }
 
 // Server manages a WireGuard endpoint over a net.PacketConn, handling the
@@ -47,6 +54,7 @@ type Server struct {
 	onPeerConnected     func(peerKey NoisePublicKey, handler *Handler)
 	maintenanceInterval time.Duration
 	readBufferSize      int
+	concurrency         int
 
 	connMu sync.RWMutex
 	conn   net.PacketConn
@@ -83,6 +91,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if bufSize == 0 {
 		bufSize = 2048
 	}
+	conc := cfg.Concurrency
+	if conc <= 0 {
+		conc = runtime.NumCPU()
+	}
 
 	s := &Server{
 		handler:             cfg.Handler,
@@ -91,6 +103,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		onPeerConnected:     cfg.OnPeerConnected,
 		maintenanceInterval: interval,
 		readBufferSize:      bufSize,
+		concurrency:         conc,
 		done:                make(chan struct{}),
 		ready:               make(chan struct{}),
 		peerAddrs:           make(map[NoisePublicKey]*net.UDPAddr),
@@ -103,14 +116,17 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 // Serve starts the read loop and maintenance goroutines, blocking until
 // Close is called or the connection encounters a permanent error.
+// The number of reader goroutines is controlled by [ServerConfig.Concurrency].
 func (s *Server) Serve(conn net.PacketConn) error {
 	s.connMu.Lock()
 	s.conn = conn
 	s.connMu.Unlock()
 	close(s.ready)
 
-	s.wg.Add(2)
-	go s.readLoop()
+	s.wg.Add(s.concurrency + 1)
+	for range s.concurrency {
+		go s.readLoop()
+	}
 	go s.maintenanceLoop()
 
 	<-s.done
