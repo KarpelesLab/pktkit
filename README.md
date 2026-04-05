@@ -7,7 +7,7 @@
 
 Zero-copy L2/L3 packet handling library for Go.
 
-pktkit provides primitives for building virtual network topologies: devices, hubs, and adapters that move Ethernet frames and IP packets without copying buffers on the hot path.
+pktkit provides primitives for building virtual network topologies: devices, hubs, adapters, and tunnels that move Ethernet frames and IP packets without copying buffers on the hot path.
 
 ## Features
 
@@ -23,6 +23,8 @@ pktkit provides primitives for building virtual network topologies: devices, hub
 - **L2Hub**: MAC-learning switch with 5-minute aging — forwards unicast to learned ports, floods unknown/broadcast/multicast
 - **L3Hub**: routing hub with prefix-based unicast forwarding and broadcast/multicast delivery
 - **ConnectL2 / ConnectL3**: point-to-point wiring helpers (`a.SetHandler(b.Send)`)
+- **L2Connector / L3Connector**: lifecycle-managed device attachment with cleanup callbacks
+- **Serve**: accept loop connecting incoming L2Devices to a connector, with automatic cleanup on disconnect
 
 ### Bridging
 
@@ -31,10 +33,14 @@ pktkit provides primitives for building virtual network topologies: devices, hub
 
 ### Subpackages
 
-- **slirp**: NAT stack implementing L3Device — routes virtual traffic to the real network via `net.Dial`, supports IPv4/IPv6 TCP, UDP, and ICMPv6
+- **slirp**: userspace NAT stack implementing L3Device — routes virtual traffic to the real network via `net.Dial`, with namespace-isolated connection tracking for multi-tenant use (`ConnectL3`). Supports IPv4/IPv6 TCP, UDP, and ICMPv6.
 - **vclient**: virtual network client implementing L3Device — provides `Dial`, `Listen`, `net.Conn`, DNS resolution, and `http.Client`
-- **vtcp**: pure RFC-compliant TCP protocol engine (congestion control, SACK, timestamps, window scaling)
-- **nat**: IPv4 NAT between two virtual L3 networks with ALGs (FTP, SIP, H.323, PPTP, TFTP, IRC), NAT64, defragmentation, and UPnP
+- **vtcp**: pure RFC-compliant TCP protocol engine (congestion control, SACK, timestamps, window scaling, SYN cookies)
+- **nat**: packet-level IPv4 NAT between two virtual L3 networks with ALGs (FTP, SIP, H.323, PPTP, TFTP, IRC), NAT64, defragmentation, namespace isolation, and UPnP
+- **wg**: WireGuard tunnel implementation with Noise IK handshake, per-peer L3 isolation, and adapter bridging peers to pktkit networks
+- **ovpn**: OpenVPN server with TLS key exchange, AES-CBC/GCM encryption, per-peer L3/L2 isolation, and username/password authentication
+- **tuntap**: OS-level TUN/TAP devices with IP address and route configuration (Linux and macOS)
+- **qemu**: QEMU userspace network socket protocol (both client and server/listener)
 
 ## Usage
 
@@ -51,13 +57,6 @@ pktkit.ConnectL3(tun1, tun2)
 ### Virtual LAN with DHCP and NAT
 
 ```go
-import (
-    "github.com/KarpelesLab/pktkit"
-    "github.com/KarpelesLab/pktkit/slirp"
-    "github.com/KarpelesLab/pktkit/vclient"
-)
-
-// L2 switch (MAC-learning)
 hub := pktkit.NewL2Hub()
 
 // DHCP server
@@ -78,14 +77,46 @@ hub.Connect(pktkit.NewL2Adapter(stack, nil))
 
 // Virtual client — gets IP via DHCP, can dial out
 client := vclient.New()
-client.SetIP(net.IPv4zero, net.CIDRMask(0, 32), net.IPv4(192, 168, 0, 1))
-client.SetDNS([]net.IP{net.IPv4(1, 1, 1, 1)})
 adapter := pktkit.NewL2Adapter(client, nil)
 hub.Connect(adapter)
 adapter.StartDHCP()
 
 // Use standard Go HTTP client over the virtual network
 resp, _ := client.HTTPClient().Get("https://example.com")
+```
+
+### WireGuard server with per-peer isolation
+
+Each WireGuard peer gets a namespace-isolated NAT connection on a single
+slirp stack. Peers can share the same IP address without conflict.
+
+```go
+stack := slirp.New()
+stack.SetAddr(netip.MustParsePrefix("10.0.0.1/24"))
+
+adapter, _ := wg.NewAdapter(wg.AdapterConfig{
+    Connector: stack, // each peer gets isolated NAT via ConnectL3
+})
+
+udp, _ := net.ListenPacket("udp4", ":51820")
+go adapter.Serve(udp)
+
+// Add authorized peers
+adapter.AddPeer(clientPublicKey)
+```
+
+### QEMU VM networking
+
+Connect QEMU VMs via the socket protocol. Each accepted connection
+can join a shared hub or get an isolated namespace.
+
+```go
+ln, _ := qemu.Listen("unix", "/tmp/qemu.sock")
+
+hub := pktkit.NewL2Hub()
+// hub.Connect(pktkit.NewL2Adapter(stack, nil)) // add a NAT gateway
+
+pktkit.Serve(ln, hub) // accept loop: each VM joins the hub
 ```
 
 ## Performance
