@@ -177,6 +177,9 @@ func (o *Options) ParseCipher(c string) error {
 	}
 
 	info := strings.Split(c, "-")
+	if len(info) != 3 {
+		return errors.New("invalid cipher format, expected ALG-SIZE-MODE")
+	}
 
 	if info[0] != "AES" {
 		return errors.New("only AES is supported")

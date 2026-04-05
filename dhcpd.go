@@ -35,6 +35,8 @@ type dhcpLease struct {
 	expiry time.Time
 }
 
+const maxDHCPLeases = 1024
+
 // DHCPServer is an L2 device that serves DHCP leases on an Ethernet network.
 type DHCPServer struct {
 	cfg     DHCPServerConfig
@@ -199,6 +201,10 @@ func (s *DHCPServer) allocate(mac [6]byte) netip.Addr {
 		}
 	}
 
+	if len(s.leases) >= maxDHCPLeases {
+		return netip.Addr{} // lease table full
+	}
+
 	for ip := s.cfg.RangeStart; ip.Compare(s.cfg.RangeEnd) <= 0; ip = ip.Next() {
 		if assigned[ip] {
 			continue
@@ -222,6 +228,9 @@ func (s *DHCPServer) confirm(mac [6]byte, requested netip.Addr) netip.Addr {
 	l, ok := s.leases[mac]
 	if !ok {
 		// No existing lease — try to grant the requested IP if it's valid and in range.
+		if len(s.leases) >= maxDHCPLeases {
+			return netip.Addr{} // lease table full
+		}
 		if !requested.IsValid() {
 			return netip.Addr{}
 		}

@@ -156,16 +156,20 @@ func (s *SendBuf) RetransmitData(n int) []byte {
 		return data
 	}
 
-	// Find the first unsacked byte starting from UNA
+	// Find the first unsacked byte starting from UNA by skipping SACK ranges.
+	// This is O(m) where m = number of SACK blocks, not O(n*m).
 	seq := s.una
-	for {
-		if !s.IsSACKed(seq) {
-			break
+	for changed := true; changed; {
+		changed = false
+		for _, b := range s.sacked {
+			if SeqAfterEq(seq, b.Left) && SeqBefore(seq, b.Right) {
+				seq = b.Right
+				changed = true
+			}
 		}
-		seq++
-		if SeqAfterEq(seq, s.nxt) {
-			return nil // everything is SACKed
-		}
+	}
+	if SeqAfterEq(seq, s.nxt) {
+		return nil // everything is SACKed
 	}
 
 	offset := int(seq - s.una)

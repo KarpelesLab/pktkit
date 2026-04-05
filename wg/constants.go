@@ -49,8 +49,13 @@ const (
 	// before being cleaned up by Maintenance.
 	RejectAfterTime = 180 * time.Second
 
+	// Rekey thresholds (WireGuard spec §5.1)
+	RekeyAfterMessages  = uint64(1) << 60
+	RejectAfterMessages = ^uint64(0) - (uint64(1) << 13)
+	RekeyAfterTime      = 120 * time.Second
+
 	// DoS mitigation
-	defaultLoadThreshold = 100
+	defaultLoadThreshold = 20
 
 	// Key sizes
 	NoisePublicKeySize    = 32
@@ -59,6 +64,10 @@ const (
 
 	// WindowSize is the size of the replay protection sliding window.
 	WindowSize = 8192
+
+	// Map size limits for DoS mitigation
+	maxHandshakes = 10000
+	maxSessions   = 10000
 )
 
 // NoisePublicKey is a Curve25519 public key.

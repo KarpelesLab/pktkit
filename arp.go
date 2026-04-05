@@ -16,6 +16,7 @@ const (
 	arpPendingMaxPkts  = 16
 	arpPendingTimeout  = 3 * time.Second
 	arpCleanupInterval = 1 * time.Second
+	arpMaxEntries      = 4096
 )
 
 var broadcastMAC = net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
@@ -58,6 +59,19 @@ func (t *arpTable) Lookup(ip netip.Addr) (net.HardwareAddr, bool) {
 // Set stores a MAC for the given IP with the specified TTL.
 func (t *arpTable) Set(ip netip.Addr, mac net.HardwareAddr, ttl time.Duration) {
 	t.mu.Lock()
+	if _, exists := t.entries[ip]; !exists && len(t.entries) >= arpMaxEntries {
+		// Table full — prune expired entries before inserting.
+		now := time.Now()
+		for k, e := range t.entries {
+			if now.After(e.expires) {
+				delete(t.entries, k)
+			}
+		}
+		if len(t.entries) >= arpMaxEntries {
+			t.mu.Unlock()
+			return // still full, drop the insert
+		}
+	}
 	t.entries[ip] = arpEntry{mac: mac, expires: time.Now().Add(ttl)}
 	t.mu.Unlock()
 }

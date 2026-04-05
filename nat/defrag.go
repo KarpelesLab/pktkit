@@ -184,6 +184,9 @@ func (d *Defragger) Process(pkt pktkit.Packet) pktkit.Packet {
 
 	// Build the final packet with the first fragment's IP header.
 	totalLen := len(firstHdr) + len(reassembled)
+	if totalLen > 65535 {
+		return nil
+	}
 	result := make(pktkit.Packet, totalLen)
 	copy(result, firstHdr)
 	copy(result[len(firstHdr):], reassembled)

@@ -57,12 +57,14 @@ type session struct {
 
 // keypair represents a derived keypair for transport data.
 type keypair struct {
+	sendCounter  uint64 // atomic; next nonce counter for this keypair
 	send         aead
 	receive      aead
 	isInitiator  bool
 	created      time.Time
 	localIndex   uint32
 	remoteIndex  uint32
+	peerKey      NoisePublicKey // identifies which peer owns this keypair
 	replayFilter slidingWindow
 }
 

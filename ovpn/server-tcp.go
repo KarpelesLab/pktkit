@@ -24,7 +24,7 @@ func (o *OVpn) tcpThread() {
 	for {
 		c, err := o.tcp.AcceptTCP()
 		if err != nil {
-			if o.terminating {
+			if o.terminating.Load() {
 				return
 			}
 			log.Println("[ovpn] Failed accepting TCP connection:", err)
@@ -46,12 +46,12 @@ func (o *OVpn) ServerTcpClient(c *net.TCPConn) error {
 		return err
 	}
 	res := &ServerTcp{o: o, c: c}
-	go res.TcpThread()
 
 	o.peersLock.Lock()
-	defer o.peersLock.Unlock()
 	o.peers[k] = NewPeer(res, o, k)
+	o.peersLock.Unlock()
 
+	go res.TcpThread()
 	return nil
 }
 

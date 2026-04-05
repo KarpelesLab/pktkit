@@ -6,6 +6,7 @@ package wg
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -56,20 +57,8 @@ func (h *Handler) processDataPacket(data []byte) (*PacketResult, error) {
 		return nil, fmt.Errorf("decrypt failed: %w", err)
 	}
 
-	// Find peer key for this keypair by looking up sessions
-	var peerKey NoisePublicKey
-	h.sessionsMutex.RLock()
-	for pk, sess := range h.sessions {
-		sess.mutex.RLock()
-		match := (sess.keypairCurrent != nil && sess.keypairCurrent.localIndex == receiverIdx) ||
-			(sess.keypairPrev != nil && sess.keypairPrev.localIndex == receiverIdx)
-		sess.mutex.RUnlock()
-		if match {
-			peerKey = pk
-			break
-		}
-	}
-	h.sessionsMutex.RUnlock()
+	// Peer key is stored directly on the keypair — O(1) lookup.
+	peerKey := kp.peerKey
 
 	// Update session last received time
 	h.sessionsMutex.RLock()
@@ -94,6 +83,10 @@ func (h *Handler) processDataPacket(data []byte) (*PacketResult, error) {
 
 // encryptDataPacket encrypts data for transmission to a peer and returns a
 // complete type-4 transport packet. Pass empty data to generate a keepalive.
+//
+// Returns ErrRekeyRequired alongside a valid packet when the keypair has
+// exceeded RekeyAfterTime or RekeyAfterMessages. The caller should send
+// the packet and then initiate a new handshake.
 func (h *Handler) encryptDataPacket(data []byte, peerKey NoisePublicKey) ([]byte, error) {
 	// Find session
 	h.sessionsMutex.RLock()
@@ -119,12 +112,13 @@ func (h *Handler) encryptDataPacket(data []byte, peerKey NoisePublicKey) ([]byte
 	sess.lastSent = now()
 	sess.mutex.Unlock()
 
-	// Increment counter
-	h.countersMutex.Lock()
-	counter := h.peerCounters[peerKey]
-	counter++
-	h.peerCounters[peerKey] = counter
-	h.countersMutex.Unlock()
+	// Increment per-keypair counter (starts at 0)
+	counter := atomic.AddUint64(&kp.sendCounter, 1) - 1
+
+	// Reject after too many messages
+	if counter >= RejectAfterMessages {
+		return nil, fmt.Errorf("keypair message limit exceeded: initiate new handshake")
+	}
 
 	// Create nonce from counter
 	var nonce [chacha20poly1305.NonceSize]byte
@@ -139,6 +133,11 @@ func (h *Handler) encryptDataPacket(data []byte, peerKey NoisePublicKey) ([]byte
 	binary_le_put_uint32(result[4:8], remoteIndex)
 	binary_le_put_uint64(result[8:16], counter)
 	copy(result[messageTransportHeaderSize:], ciphertext)
+
+	// Signal rekey if approaching limits
+	if counter >= RekeyAfterMessages || now().Sub(kp.created) >= RekeyAfterTime {
+		return result, ErrRekeyRequired
+	}
 
 	return result, nil
 }

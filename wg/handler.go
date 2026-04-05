@@ -6,12 +6,19 @@ package wg
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// ErrRekeyRequired is returned alongside a valid encrypted packet when the
+// keypair has exceeded RekeyAfterTime or RekeyAfterMessages. The caller
+// should send the packet and then initiate a new handshake.
+var ErrRekeyRequired = errors.New("rekey required")
 
 // UnknownPeerFunc is called when a handshake is received from an unknown peer.
 // The packet slice is only valid for the duration of the call — the callback
@@ -34,6 +41,10 @@ type Config struct {
 	// OnUnknownPeer is called when a handshake arrives from an unauthorized peer.
 	// If nil, unknown peers are rejected.
 	OnUnknownPeer UnknownPeerFunc
+
+	// LoadThreshold sets the number of concurrent handshakes before MAC2
+	// cookie validation is required. 0 uses the default (20).
+	LoadThreshold int
 }
 
 // PacketType indicates the type of a processed packet result.
@@ -93,10 +104,10 @@ type peerEntry struct {
 // responder roles. Use InitiateHandshake to start a connection, or pass
 // incoming packets to ProcessPacket to respond to them.
 type Handler struct {
-	privateKey      NoisePrivateKey
-	publicKey       NoisePublicKey
-	conn            net.PacketConn
-	onUnknownPeer   UnknownPeerFunc
+	privateKey    NoisePrivateKey
+	publicKey     NoisePublicKey
+	conn         atomic.Value // net.PacketConn
+	onUnknownPeer UnknownPeerFunc
 	cookieChecker   cookieChecker
 	cookieGenerator cookieGenerator
 
@@ -105,6 +116,7 @@ type Handler struct {
 	loadMutex        sync.RWMutex
 	activeHandshakes int
 	handshakeMutex   sync.RWMutex
+	loadThreshold    int
 
 	// Handshake tracking
 	handshakes      map[uint32]*handshake
@@ -113,10 +125,6 @@ type Handler struct {
 	// Keypair tracking
 	keypairs      map[uint32]*keypair
 	keypairsMutex sync.RWMutex
-
-	// Per-peer send counters
-	peerCounters  map[NoisePublicKey]uint64
-	countersMutex sync.RWMutex
 
 	// Sessions by peer public key
 	sessions      map[NoisePublicKey]*session
@@ -140,16 +148,23 @@ func NewHandler(cfg Config) (*Handler, error) {
 
 	pubKey := privKey.PublicKey()
 
+	loadThreshold := cfg.LoadThreshold
+	if loadThreshold <= 0 {
+		loadThreshold = defaultLoadThreshold
+	}
+
 	h := &Handler{
 		privateKey:    privKey,
 		publicKey:     pubKey,
-		conn:          cfg.Conn,
 		onUnknownPeer: cfg.OnUnknownPeer,
+		loadThreshold: loadThreshold,
 		handshakes:    make(map[uint32]*handshake),
 		keypairs:      make(map[uint32]*keypair),
 		sessions:      make(map[NoisePublicKey]*session),
-		peerCounters:  make(map[NoisePublicKey]uint64),
 		peers:         make(map[NoisePublicKey]*peerEntry),
+	}
+	if cfg.Conn != nil {
+		h.conn.Store(cfg.Conn)
 	}
 
 	h.cookieChecker.Init(pubKey)
@@ -160,7 +175,16 @@ func NewHandler(cfg Config) (*Handler, error) {
 
 // SetConn sets the handler's packet connection for AcceptUnknownPeer responses.
 func (h *Handler) SetConn(conn net.PacketConn) {
-	h.conn = conn
+	h.conn.Store(conn)
+}
+
+// getConn returns the handler's packet connection, or nil.
+func (h *Handler) getConn() net.PacketConn {
+	v := h.conn.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(net.PacketConn)
 }
 
 // PublicKey returns the handler's public key.
@@ -205,7 +229,8 @@ func (h *Handler) AddPeerWithPSK(peerKey NoisePublicKey, psk NoisePresharedKey) 
 // handler's connection. Call this from an OnUnknownPeer callback (or later)
 // after verifying the peer.
 func (h *Handler) AcceptUnknownPeer(peerKey NoisePublicKey, initiationPacket []byte, remoteAddr *net.UDPAddr) error {
-	if h.conn == nil {
+	conn := h.getConn()
+	if conn == nil {
 		return fmt.Errorf("no connection set on handler")
 	}
 	h.AddPeer(peerKey)
@@ -213,7 +238,7 @@ func (h *Handler) AcceptUnknownPeer(peerKey NoisePublicKey, initiationPacket []b
 	if err != nil {
 		return err
 	}
-	_, err = h.conn.WriteTo(result.Response, remoteAddr)
+	_, err = conn.WriteTo(result.Response, remoteAddr)
 	return err
 }
 
@@ -436,7 +461,7 @@ func (h *Handler) incrementActiveHandshakes() {
 
 	h.activeHandshakes++
 
-	if h.activeHandshakes > defaultLoadThreshold {
+	if h.activeHandshakes > h.loadThreshold {
 		h.loadMutex.Lock()
 		h.underLoad = true
 		h.loadMutex.Unlock()
@@ -451,7 +476,7 @@ func (h *Handler) decrementActiveHandshakes() {
 		h.activeHandshakes--
 	}
 
-	if h.activeHandshakes < defaultLoadThreshold/2 {
+	if h.activeHandshakes < h.loadThreshold/2 {
 		h.loadMutex.Lock()
 		wasLoaded := h.underLoad
 		h.underLoad = false

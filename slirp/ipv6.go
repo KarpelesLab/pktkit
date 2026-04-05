@@ -122,6 +122,10 @@ func (s *Stack) handleIPv6TCP(ns uint64, packet []byte, srcIP, dstIP [16]byte, t
 		k := key6{ns: ns, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 		vc := s.virtTCP6[k]
 		if vc == nil {
+			if len(s.virtTCP6) >= maxVirtTCPConns {
+				s.mu.Unlock()
+				return errors.New("virtual TCP6 connection limit reached")
+			}
 			// Use SYN cookies when the accept queue is nearly full.
 			if len(listener.acceptCh) >= cap(listener.acceptCh)-1 {
 				seg, err := vtcp.ParseSegment(tcp)
@@ -224,7 +228,7 @@ func (s *Stack) handleIPv6TCP(ns uint64, packet []byte, srcIP, dstIP [16]byte, t
 		if cookieListener != nil {
 			seg, err := vtcp.ParseSegment(tcp)
 			if err == nil {
-				if mss, _, ok := s.syncookies.ValidateACK(seg, dstPort); ok {
+				if mss, _, ok := s.syncookies.ValidateACK(seg, dstPort); ok && len(s.virtTCP6) < maxVirtTCPConns {
 					localAddr := &net.TCPAddr{IP: net.IP(dstIP[:]), Port: int(dstPort)}
 					remoteAddr := &net.TCPAddr{IP: net.IP(srcIP[:]), Port: int(srcPort)}
 					vc := vtcp.NewConn(vtcp.ConnConfig{

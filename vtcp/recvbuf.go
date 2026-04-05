@@ -1,5 +1,7 @@
 package vtcp
 
+const maxOOOEntries = 128
+
 // RecvBuf reassembles an incoming TCP byte stream, handling both in-order
 // and out-of-order segments. It maintains a SACK scoreboard for reporting
 // non-contiguous received blocks.
@@ -82,8 +84,10 @@ func (r *RecvBuf) Insert(seq uint32, data []byte) int {
 		return len(data)
 	}
 
-	// Out-of-order: buffer for later
-	r.insertOOO(seq, data)
+	// Out-of-order: buffer for later (capped to prevent memory exhaustion)
+	if len(r.ooo) < maxOOOEntries {
+		r.insertOOO(seq, data)
+	}
 	return 0
 }
 

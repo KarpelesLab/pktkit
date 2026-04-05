@@ -55,6 +55,8 @@ type Stack struct {
 	closeOnce sync.Once
 }
 
+const maxVirtTCPConns = 10000
+
 func New() *Stack {
 	s := &Stack{
 		tcp:        make(map[key]*tcpNATConn),
@@ -289,9 +291,15 @@ func (s *Stack) handleIPv4(ns uint64, ip []byte) error {
 		return errors.New("IPv4 packet too short")
 	}
 	ihl := int(ip[0]&0x0F) * 4
-	if len(ip) < ihl {
+	if ihl < 20 || len(ip) < ihl {
 		return errors.New("invalid ihl")
 	}
+	// Enforce IPv4 Total Length — truncate trailing padding.
+	totalLen := int(binary.BigEndian.Uint16(ip[2:4]))
+	if totalLen < ihl || totalLen > len(ip) {
+		return errors.New("invalid IPv4 total length")
+	}
+	ip = ip[:totalLen]
 	proto := ip[9]
 	var srcIP, dstIP [4]byte
 	copy(srcIP[:], ip[12:16])
@@ -322,6 +330,10 @@ func (s *Stack) handleIPv4(ns uint64, ip []byte) error {
 			k := key{ns: ns, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 			vc := s.virtTCP[k]
 			if vc == nil {
+				if len(s.virtTCP) >= maxVirtTCPConns {
+					s.mu.Unlock()
+					return errors.New("virtual TCP connection limit reached")
+				}
 				if len(listener.acceptCh) >= cap(listener.acceptCh)-1 {
 					seg, err := vtcp.ParseSegment(tcp)
 					if err != nil {
@@ -423,7 +435,7 @@ func (s *Stack) handleIPv4(ns uint64, ip []byte) error {
 			if cookieListener != nil {
 				seg, err := vtcp.ParseSegment(tcp)
 				if err == nil {
-					if mss, _, ok := s.syncookies.ValidateACK(seg, dstPort); ok {
+					if mss, _, ok := s.syncookies.ValidateACK(seg, dstPort); ok && len(s.virtTCP) < maxVirtTCPConns {
 						localAddr := &net.TCPAddr{IP: net.IP(dstIP[:]).To4(), Port: int(dstPort)}
 						remoteAddr := &net.TCPAddr{IP: net.IP(srcIP[:]).To4(), Port: int(srcPort)}
 						vc := vtcp.NewConn(vtcp.ConnConfig{

@@ -19,7 +19,7 @@ func (o *OVpn) udpThread() {
 	for {
 		n, addr, err := o.udp.ReadFromUDP(buf)
 		if err != nil {
-			if o.terminating {
+			if o.terminating.Load() {
 				return
 			}
 			log.Printf("[ovpn] Failed to read from udp: %v", err)

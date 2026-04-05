@@ -17,7 +17,10 @@ type l2Port struct {
 	id  uint64
 }
 
-const macAgingDuration = 5 * time.Minute
+const (
+	macAgingDuration = 5 * time.Minute
+	macTableMaxSize  = 8192
+)
 
 type macEntry struct {
 	portID  uint64
@@ -32,9 +35,10 @@ type macEntry struct {
 // It uses a copy-on-write port list for lock-free reads on the hot path
 // and a sync.Map for the MAC address table.
 type L2Hub struct {
-	ports    atomic.Value // []l2Port
-	mu       sync.Mutex   // serializes connect/disconnect
-	macTable sync.Map     // [6]byte → macEntry
+	ports       atomic.Value // []l2Port
+	mu          sync.Mutex   // serializes connect/disconnect
+	macTable    sync.Map     // [6]byte → macEntry
+	macTableLen atomic.Int64 // approximate count for cap enforcement
 }
 
 // NewL2Hub creates a new L2 learning switch.
@@ -79,10 +83,17 @@ func (h *L2Hub) forward(f Frame, sourceID uint64) {
 	var srcMAC [6]byte
 	copy(srcMAC[:], f[6:12])
 	if v, ok := h.macTable.Load(srcMAC); !ok || v.(macEntry).portID != sourceID {
-		h.macTable.Store(srcMAC, macEntry{
-			portID:  sourceID,
-			expires: time.Now().Add(macAgingDuration).UnixNano(),
-		})
+		if !ok && h.macTableLen.Load() >= macTableMaxSize {
+			// Table full — skip learning to prevent memory exhaustion.
+		} else {
+			if !ok {
+				h.macTableLen.Add(1)
+			}
+			h.macTable.Store(srcMAC, macEntry{
+				portID:  sourceID,
+				expires: time.Now().Add(macAgingDuration).UnixNano(),
+			})
+		}
 	}
 
 	ports := h.ports.Load().([]l2Port)
@@ -114,6 +125,7 @@ func (h *L2Hub) forward(f Frame, sourceID uint64) {
 		}
 		// Expired entry — remove and flood.
 		h.macTable.Delete(dstMAC)
+		h.macTableLen.Add(-1)
 	}
 
 	// Unknown unicast — flood.
@@ -140,6 +152,7 @@ func (h *L2Hub) disconnect(id uint64) {
 	h.macTable.Range(func(key, value any) bool {
 		if value.(macEntry).portID == id {
 			h.macTable.Delete(key)
+			h.macTableLen.Add(-1)
 		}
 		return true
 	})

@@ -38,6 +38,7 @@ type Peer struct {
 	tlsConn *tls.Conn
 
 	IdleTimer uint32
+	closeOnce sync.Once
 
 	opts *Options
 	keys *PeerKeys
@@ -503,11 +504,11 @@ func (p *Peer) Send(pkt []byte) error {
 }
 
 func (p *Peer) Close() {
-	if !p.conn.closed {
+	p.closeOnce.Do(func() {
 		p.conn.closed = true
 		close(p.conn.readChan)
-	}
-	p.c.Close()
+		p.c.Close()
+	})
 	p.Unregister()
 }
 

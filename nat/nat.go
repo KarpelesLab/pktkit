@@ -286,6 +286,9 @@ func (n *NAT) handleOutbound(ns uint64, pkt pktkit.Packet) {
 	}
 
 	ihl := int(pkt[0]&0x0F) * 4
+	if ihl < 20 {
+		return
+	}
 	proto := pkt[9]
 
 	switch proto {
@@ -404,6 +407,9 @@ func (n *NAT) handleInbound(pkt pktkit.Packet) {
 	}
 
 	ihl := int(pkt[0]&0x0F) * 4
+	if ihl < 20 {
+		return
+	}
 	proto := pkt[9]
 
 	switch proto {

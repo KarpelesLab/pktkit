@@ -167,8 +167,10 @@ func (a *L2Adapter) handleIncomingL2Frame(f Frame) error {
 			}
 		}
 
-		// Intercept ICMPv6 NDP messages
-		if pkt.Version() == 6 && pkt.IPv6NextHeader() == ProtocolICMPv6 {
+		// Intercept ICMPv6 NDP messages.
+		// RFC 4861 §6.1.1: NDP messages MUST have hop limit 255
+		// to prevent off-link spoofing.
+		if pkt.Version() == 6 && pkt.IPv6NextHeader() == ProtocolICMPv6 && pkt.IPv6HopLimit() == 255 {
 			if a.handleNDP(pkt) {
 				return nil // consumed by NDP
 			}

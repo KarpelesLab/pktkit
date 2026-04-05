@@ -85,14 +85,17 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	}
 
 	kdf2(&hs.chainKey, &key, hs.chainKey[:], tempSS)
+	setZero(tempSS)
 
 	aeadCipher, _ := chacha20poly1305.New(key[:])
 	clientStaticKey, err := aeadCipher.Open(nil, zeroNonce[:], msg.Static[:], hs.hash[:])
 	if err != nil {
+		setZero(key[:])
 		return nil, fmt.Errorf("decrypt static key: %w", err)
 	}
 
 	if len(clientStaticKey) != 32 {
+		setZero(key[:])
 		return nil, fmt.Errorf("invalid client static key length: %d", len(clientStaticKey))
 	}
 
@@ -102,11 +105,13 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	// === Static-static DH ===
 	tempSS, err = curve25519.X25519(serverPrivateKey[:], hs.remoteStatic[:])
 	if err != nil {
+		setZero(key[:])
 		return nil, fmt.Errorf("static DH failed: %w", err)
 	}
 
 	copy(hs.precomputedStaticStatic[:], tempSS)
 	kdf2(&hs.chainKey, &key, hs.chainKey[:], tempSS)
+	setZero(tempSS)
 
 	// === Decrypt timestamp ===
 	aeadCipher, _ = chacha20poly1305.New(key[:])
@@ -171,6 +176,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 		return nil, fmt.Errorf("ee DH failed: %w", err)
 	}
 	mixKey(&hs.chainKey, &hs.chainKey, tempSS)
+	setZero(tempSS)
 
 	// se: ephemeral-static
 	tempSS, err = curve25519.X25519(hs.localEphemeral[:], hs.remoteStatic[:])
@@ -178,6 +184,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 		return nil, fmt.Errorf("es DH failed: %w", err)
 	}
 	mixKey(&hs.chainKey, &hs.chainKey, tempSS)
+	setZero(tempSS)
 
 	// === Preshared key ===
 	psk := h.getPresharedKey(hs.remoteStatic)
@@ -185,6 +192,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 
 	// === Encrypt empty message ===
 	aeadCipher, _ = chacha20poly1305.New(key[:])
+	setZero(key[:])
 	emptyData := aeadCipher.Seal(nil, zeroNonce[:], []byte{}, hs.hash[:])
 
 	if len(emptyData) != chacha20poly1305.Overhead {
@@ -223,19 +231,19 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 		}
 	}
 
-	// === Store handshake ===
+	// === Derive transport keys ===
 	hs.localIndex = senderIdx
 	hs.state = handshakeResponseCreated
 	hs.created = now()
 
-	h.handshakesMutex.Lock()
-	h.handshakes[senderIdx] = &hs
-	h.handshakesMutex.Unlock()
-
-	// === Derive transport keys ===
 	// As responder: receive with first key, send with second
 	var recvKey, sendKey [chacha20poly1305.KeySize]byte
 	kdf2(&recvKey, &sendKey, hs.chainKey[:], nil)
+
+	// Zero sensitive handshake material now that keys are derived
+	setZero(hs.localEphemeral[:])
+	setZero(hs.chainKey[:])
+	setZero(hs.precomputedStaticStatic[:])
 
 	kp := &keypair{
 		send:        createAEAD(sendKey),
@@ -243,16 +251,27 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 		created:     now(),
 		localIndex:  hs.localIndex,
 		remoteIndex: hs.remoteIndex,
+		peerKey:     hs.remoteStatic,
 		isInitiator: false,
 	}
 	kp.replayFilter.Reset()
+	setZero(recvKey[:])
+	setZero(sendKey[:])
 
 	h.keypairsMutex.Lock()
+	if len(h.keypairs) >= maxHandshakes {
+		h.keypairsMutex.Unlock()
+		return nil, fmt.Errorf("keypair table full")
+	}
 	h.keypairs[hs.localIndex] = kp
 	h.keypairsMutex.Unlock()
 
 	// === Update session ===
 	h.sessionsMutex.Lock()
+	if len(h.sessions) >= maxSessions && h.sessions[hs.remoteStatic] == nil {
+		h.sessionsMutex.Unlock()
+		return nil, fmt.Errorf("session table full")
+	}
 	if sess, exists := h.sessions[hs.remoteStatic]; exists {
 		sess.mutex.Lock()
 		if sess.keypairCurrent != nil {
@@ -379,6 +398,7 @@ func (h *Handler) InitiateHandshake(peerKey NoisePublicKey) ([]byte, error) {
 		return nil, fmt.Errorf("static DH failed: %w", err)
 	}
 	copy(hs.precomputedStaticStatic[:], tempSS)
+	setZero(tempSS)
 
 	// Mix responder's static key into hash
 	mixHash(&hs.hash, &hs.hash, peerKey[:])
@@ -401,6 +421,7 @@ func (h *Handler) InitiateHandshake(peerKey NoisePublicKey) ([]byte, error) {
 
 	var key [chacha20poly1305.KeySize]byte
 	kdf2(&hs.chainKey, &key, hs.chainKey[:], tempSS)
+	setZero(tempSS)
 
 	// Encrypt client static key
 	aeadCipher, _ := chacha20poly1305.New(key[:])
@@ -455,6 +476,10 @@ func (h *Handler) InitiateHandshake(peerKey NoisePublicKey) ([]byte, error) {
 
 	// Store handshake state
 	h.handshakesMutex.Lock()
+	if len(h.handshakes) >= maxHandshakes {
+		h.handshakesMutex.Unlock()
+		return nil, fmt.Errorf("handshake table full")
+	}
 	h.handshakes[senderIdx] = &hs
 	h.handshakesMutex.Unlock()
 
@@ -500,6 +525,7 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 		return nil, fmt.Errorf("ee DH failed: %w", err)
 	}
 	mixKey(&chainKey, &chainKey, tempSS)
+	setZero(tempSS)
 
 	// DH se: client_static_priv x server_eph_pub
 	tempSS, err = curve25519.X25519(h.privateKey[:], serverEphPub[:])
@@ -507,6 +533,7 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 		return nil, fmt.Errorf("se DH failed: %w", err)
 	}
 	mixKey(&chainKey, &chainKey, tempSS)
+	setZero(tempSS)
 
 	// Mix PSK
 	psk := h.getPresharedKey(hs.remoteStatic)
@@ -515,6 +542,7 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 
 	// AEAD open empty field with hash as AD
 	aeadCipher, _ := chacha20poly1305.New(key[:])
+	setZero(key[:])
 	_, err = aeadCipher.Open(nil, zeroNonce[:], msg.Empty[:], hash[:])
 	if err != nil {
 		return nil, fmt.Errorf("decrypt empty: %w", err)
@@ -528,6 +556,14 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 	// Derive transport keys — initiator: first=send, second=receive
 	var sendKey, recvKey [chacha20poly1305.KeySize]byte
 	kdf2(&sendKey, &recvKey, chainKey[:], nil)
+	setZero(chainKey[:])
+
+	// Zero sensitive handshake material
+	setZero(hs.localEphemeral[:])
+	setZero(hs.chainKey[:])
+	setZero(hs.precomputedStaticStatic[:])
+
+	peerKey := hs.remoteStatic
 
 	kp := &keypair{
 		send:        createAEAD(sendKey),
@@ -535,16 +571,18 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 		created:     now(),
 		localIndex:  hs.localIndex,
 		remoteIndex: msg.Sender,
+		peerKey:     peerKey,
 		isInitiator: true,
 	}
 	kp.replayFilter.Reset()
+	setZero(recvKey[:])
+	setZero(sendKey[:])
 
 	h.keypairsMutex.Lock()
 	h.keypairs[hs.localIndex] = kp
 	h.keypairsMutex.Unlock()
 
 	// Update session
-	peerKey := hs.remoteStatic
 	h.sessionsMutex.Lock()
 	if sess, exists := h.sessions[peerKey]; exists {
 		sess.mutex.Lock()

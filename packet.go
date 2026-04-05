@@ -95,12 +95,18 @@ func (p Packet) IPv4Payload() []byte {
 
 // SetIPv4SrcAddr writes the source IPv4 address in place.
 func (p Packet) SetIPv4SrcAddr(addr netip.Addr) {
+	if len(p) < 16 {
+		return
+	}
 	a := addr.As4()
 	copy(p[12:16], a[:])
 }
 
 // SetIPv4DstAddr writes the destination IPv4 address in place.
 func (p Packet) SetIPv4DstAddr(addr netip.Addr) {
+	if len(p) < 20 {
+		return
+	}
 	a := addr.As4()
 	copy(p[16:20], a[:])
 }

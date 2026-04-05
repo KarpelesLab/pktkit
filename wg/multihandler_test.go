@@ -480,8 +480,8 @@ func TestMultiHandlerEndToEnd(t *testing.T) {
 	ourAddr := udpConn.LocalAddr().(*net.UDPAddr)
 
 	// Set up async unknown-peer callbacks
-	h1.conn = udpConn
-	h2.conn = udpConn
+	h1.SetConn(udpConn)
+	h2.SetConn(udpConn)
 	makeCallback := func(h *Handler) UnknownPeerFunc {
 		return func(pk NoisePublicKey, addr *net.UDPAddr, packet []byte) {
 			pkt := make([]byte, len(packet))

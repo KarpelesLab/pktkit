@@ -24,7 +24,13 @@ func (p *Peer) tlsThread() {
 	err = p.ovpnControl()
 	if err != nil {
 		log.Printf("[ovpn] control channel process failed: %v", err)
-		p.tlsConn.Write([]byte("AUTH_FAILED," + err.Error() + "\x00"))
+		errMsg := strings.Map(func(r rune) rune {
+			if r < 32 {
+				return -1
+			}
+			return r
+		}, err.Error())
+		p.tlsConn.Write([]byte("AUTH_FAILED," + errMsg + "\x00"))
 	}
 	p.tlsConn.Close()
 
@@ -226,6 +232,10 @@ func (p *Peer) readControlString() (string, error) {
 	err := binary.Read(p.tlsConn, binary.BigEndian, &l)
 	if err != nil {
 		return "", err
+	}
+
+	if l == 0 {
+		return "", errors.New("empty control string")
 	}
 
 	str_data := make([]byte, l)

@@ -112,6 +112,9 @@ func (h *FTPHelper) rewritePORT(n *NAT, pkt pktkit.Packet, m *NATMapping, ihl, d
 	if err1 != nil || err2 != nil {
 		return pkt
 	}
+	if p1 < 0 || p1 > 255 || p2 < 0 || p2 > 255 {
+		return pkt
+	}
 	insidePort := uint16(p1*256 + p2)
 	insideIP := netip.AddrFrom4(ipBytes)
 

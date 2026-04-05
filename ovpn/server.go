@@ -17,7 +17,7 @@ type OVpn struct {
 	laddr   string
 
 	termWait    sync.WaitGroup
-	terminating bool
+	terminating atomic.Bool
 
 	peersLock sync.Mutex
 	peers     map[Addr]*Peer
@@ -55,7 +55,7 @@ func newOVpn(laddr string, tlsCfg *tls.Config) (*OVpn, error) {
 	}
 	res.udp, err = net.ListenUDP("udp", udpLaddr)
 	if err != nil {
-		res.terminating = true
+		res.terminating.Store(true)
 		res.tcp.Close()
 		return nil, err
 	}
@@ -76,17 +76,16 @@ func newOVpn(laddr string, tlsCfg *tls.Config) (*OVpn, error) {
 }
 
 func (o *OVpn) Terminate() {
-	o.terminating = true
+	o.terminating.Store(true)
 
 	o.heartBeat.Stop()
 	close(o.shutdownChannel)
 
+	o.peersLock.Lock()
 	for _, c := range o.peers {
 		c.Close()
 	}
-
-	o.peersLock.Lock()
-	defer o.peersLock.Unlock()
+	o.peersLock.Unlock()
 
 	o.tcp.Close()
 	o.udp.Close()
@@ -100,11 +99,13 @@ func (o *OVpn) monitor() {
 			close(o.deathNote)
 			return
 		case <-o.heartBeat.C:
+			o.peersLock.Lock()
 			for _, peer := range o.peers {
 				if atomic.AddUint32(&peer.IdleTimer, 1) > 6 {
 					o.deathNote <- peer
 				}
 			}
+			o.peersLock.Unlock()
 		}
 	}
 }

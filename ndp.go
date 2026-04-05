@@ -18,7 +18,8 @@ const (
 	ndpOptTargetLinkAddr = 2
 	ndpOptPrefixInfo     = 3
 
-	ndpDefaultTTL = 5 * time.Minute
+	ndpDefaultTTL  = 5 * time.Minute
+	ndpMaxEntries  = 4096
 )
 
 // ndpEntry is a neighbor cache entry mapping an IPv6 address to a MAC.
@@ -58,6 +59,18 @@ func (t *ndpTable) Lookup(ip netip.Addr) (net.HardwareAddr, bool) {
 
 func (t *ndpTable) Set(ip netip.Addr, mac net.HardwareAddr, ttl time.Duration) {
 	t.mu.Lock()
+	if _, exists := t.entries[ip]; !exists && len(t.entries) >= ndpMaxEntries {
+		now := time.Now()
+		for k, e := range t.entries {
+			if now.After(e.expires) {
+				delete(t.entries, k)
+			}
+		}
+		if len(t.entries) >= ndpMaxEntries {
+			t.mu.Unlock()
+			return
+		}
+	}
 	t.entries[ip] = ndpEntry{mac: mac, expires: time.Now().Add(ttl)}
 	t.mu.Unlock()
 }
