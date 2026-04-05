@@ -200,7 +200,7 @@ func (p *Peer) handleDataGCM(data []byte) error {
 	}
 
 	// Replay protection
-	if !p.replayWindow.check(pid) {
+	if p.replayWindow != nil && !p.replayWindow.check(pid) {
 		return nil
 	}
 

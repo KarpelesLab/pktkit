@@ -70,36 +70,42 @@ func BenchmarkDataDecryptGCM(b *testing.B) {
 			p := setupDataPeer(b, "AES-256-GCM")
 			payload := make([]byte, size)
 
-			// Encrypt a batch of packets to decrypt
-			packets := make([][]byte, 1024)
-			for i := range packets {
-				// Capture what SendData would send
-				var captured []byte
-				origSend := p.c
-				p.c = &captureSender{captured: &captured}
-				if err := p.SendData(payload); err != nil {
-					b.Fatal(err)
-				}
-				packets[i] = captured
-				p.c = origSend
+			// Encrypt a reference packet to use as template.
+			var template []byte
+			p.c = &captureSender{captured: &template}
+			if err := p.SendData(payload); err != nil {
+				b.Fatal(err)
 			}
+			p.c = &discardSender{}
 
-			// Fresh peer for decrypting (swap encrypt/decrypt keys)
+			// Fresh peer for decrypting (swap encrypt/decrypt keys).
 			dp := setupDataPeer(b, "AES-256-GCM")
-			// Swap keys: sender's encrypt = receiver's decrypt
-			dp.keys.CipherDecrypt, dp.keys.CipherEncrypt = p.keys.CipherEncrypt, p.keys.CipherDecrypt
-			dp.keys.HmacDecrypt, dp.keys.HmacEncrypt = p.keys.HmacEncrypt, p.keys.HmacDecrypt
+			dp.keys.CipherDecrypt = make([]byte, len(p.keys.CipherEncrypt))
+			copy(dp.keys.CipherDecrypt, p.keys.CipherEncrypt)
+			dp.keys.HmacDecrypt = make([]byte, len(p.keys.HmacEncrypt))
+			copy(dp.keys.HmacDecrypt, p.keys.HmacEncrypt)
+			// Force cipher block init with the swapped key.
+			dp.opts.CipherBlockDecrypt = nil
+			dp.opts.DecryptAEAD = nil
+			// Trigger lazy init
+			dp.handleData(func() []byte {
+				buf := make([]byte, len(template))
+				copy(buf, template)
+				return buf
+			}())
+			// Disable replay window so we can reuse the same packet.
+			dp.replayWindow = nil
+
+			// Pre-allocate a working buffer for copies.
+			buf := make([]byte, len(template))
 
 			b.SetBytes(int64(size))
 			b.ResetTimer()
-			idx := 0
 			for b.Loop() {
-				pkt := make([]byte, len(packets[idx%len(packets)]))
-				copy(pkt, packets[idx%len(packets)])
-				if err := dp.handleData(pkt); err != nil {
-					b.Fatal(err)
-				}
-				idx++
+				// Copy template (handleDataGCM modifies in-place).
+				// This simulates real usage where each packet arrives in its own buffer.
+				copy(buf, template)
+				dp.handleDataGCM(buf)
 			}
 		})
 	}

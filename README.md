@@ -167,8 +167,8 @@ All data-plane hot paths are zero-allocation. Benchmarks on an i9-14900K (32 thr
 | Path | ns/op | Throughput | Allocs |
 |------|------:|----------:|-------:|
 | GCM encrypt | 227 | 6.3 GB/s | 1 |
-| GCM decrypt | 1941 | 732 MB/s | 1 |
-| CBC encrypt | 8112 | 175 MB/s | 15 |
+| GCM decrypt | 202 | 7.0 GB/s | 0 |
+| CBC encrypt | 8307 | 171 MB/s | 15 |
 | Replay window | 9.2 | - | 0 |
 | PRF 1.2 (256 B) | 3497 | 73 MB/s | 25 |
 | Options parse | 721 | - | 4 |
