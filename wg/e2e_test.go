@@ -16,7 +16,7 @@ import (
 
 // findLoopBinary returns the path to the wireguard-loop-go binary.
 // It checks the WIREGUARD_LOOP_BIN environment variable first, then
-// looks in common build locations. The test is skipped if not found.
+// looks for "wireguard-loop-go" on PATH. The test is skipped if not found.
 func findLoopBinary(t *testing.T) string {
 	t.Helper()
 
@@ -27,7 +27,11 @@ func findLoopBinary(t *testing.T) string {
 		t.Fatalf("WIREGUARD_LOOP_BIN=%q does not exist", bin)
 	}
 
-	t.Skip("WIREGUARD_LOOP_BIN not set; skipping end-to-end test")
+	if bin, err := exec.LookPath("wireguard-loop-go"); err == nil {
+		return bin
+	}
+
+	t.Skip("wireguard-loop-go not found; skipping end-to-end test (install with: go install github.com/KarpelesLab/wireguard-loop-go@latest)")
 	return ""
 }
 

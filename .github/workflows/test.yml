@@ -20,6 +20,9 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
+      - name: Install wireguard-loop-go
+        run: go install github.com/KarpelesLab/wireguard-loop-go@latest
+
       - name: Build
         run: go build ./...
 
