@@ -15,20 +15,9 @@ import (
 )
 
 func TestNamespaceIsolation(t *testing.T) {
-	p := slirp.NewProvider(slirp.ProviderConfig{
-		Addr: netip.MustParsePrefix("192.168.0.1/24"),
-	})
-	defer p.Close()
-
-	ns1, _ := p.Create("ns1")
-	ns2, _ := p.Create("ns2")
-
+	// Two separate L2Hubs — no slirp needed, pure L2 isolation.
 	hub1 := pktkit.NewL2Hub()
 	hub2 := pktkit.NewL2Hub()
-	h1 := hub1.Connect(ns1.Device())
-	h2 := hub2.Connect(ns2.Device())
-	defer h1.Close()
-	defer h2.Close()
 
 	// Server on hub1 at 192.168.0.2.
 	srv1 := vclient.New()
@@ -51,7 +40,7 @@ func TestNamespaceIsolation(t *testing.T) {
 		}
 	}()
 
-	// Server on hub2 at 192.168.0.2 (same IP, different namespace).
+	// Server on hub2 at 192.168.0.2 (same IP, different hub).
 	srv2 := vclient.New()
 	defer srv2.Close()
 	srv2.SetIP(net.IPv4(192, 168, 0, 2), net.CIDRMask(24, 32), net.IPv4(192, 168, 0, 1))
@@ -114,17 +103,10 @@ func TestNamespaceIsolation(t *testing.T) {
 }
 
 // TestNamespaceHTTPIsolation verifies HTTP servers at the same IP:port
-// in different namespaces serve different content.
+// in different hubs serve different content.
 func TestNamespaceHTTPIsolation(t *testing.T) {
-	p := slirp.NewProvider(slirp.ProviderConfig{
-		Addr: netip.MustParsePrefix("10.77.0.1/24"),
-	})
-	defer p.Close()
-
-	setup := func(name, response string) (*vclient.Client, func()) {
-		ns, _ := p.Create(name)
+	setup := func(response string) (*vclient.Client, func()) {
 		hub := pktkit.NewL2Hub()
-		hns := hub.Connect(ns.Device())
 
 		srv := vclient.New()
 		srv.SetIP(net.IPv4(10, 77, 0, 2), net.CIDRMask(24, 32), net.IPv4(10, 77, 0, 1))
@@ -149,14 +131,13 @@ func TestNamespaceHTTPIsolation(t *testing.T) {
 			client.Close()
 			a.Close()
 			srv.Close()
-			hns.Close()
 		}
 		return client, cleanup
 	}
 
-	clientA, cleanA := setup("nsA", "namespace-A")
+	clientA, cleanA := setup("namespace-A")
 	defer cleanA()
-	clientB, cleanB := setup("nsB", "namespace-B")
+	clientB, cleanB := setup("namespace-B")
 	defer cleanB()
 
 	fetch := func(c *vclient.Client, want string) {
@@ -179,26 +160,23 @@ func TestNamespaceHTTPIsolation(t *testing.T) {
 	fetch(clientB, "namespace-B")
 }
 
-// TestNamespaceInternetAccess verifies that a namespace can reach the
-// real internet via slirp NAT.
+// TestNamespaceInternetAccess verifies that a namespace connected via
+// Stack.ConnectL3 can reach the real internet via slirp NAT.
 func TestNamespaceInternetAccess(t *testing.T) {
-	p := slirp.NewProvider(slirp.ProviderConfig{
-		Addr: netip.MustParsePrefix("10.55.0.1/24"),
-	})
-	defer p.Close()
-
-	ns, _ := p.Create("internet-test")
-	hub := pktkit.NewL2Hub()
-	hub.Connect(ns.Device())
+	stack := slirp.New()
+	defer stack.Close()
+	stack.SetAddr(netip.MustParsePrefix("10.55.0.1/24"))
 
 	client := vclient.New()
 	defer client.Close()
 	client.SetIP(net.IPv4(10, 55, 0, 2), net.CIDRMask(24, 32), net.IPv4(10, 55, 0, 1))
 	client.SetDNS([]net.IP{net.IPv4(1, 1, 1, 1)})
-	a := pktkit.NewL2Adapter(client, nil)
-	defer a.Close()
-	a.SetGateway(netip.MustParseAddr("10.55.0.1"))
-	hub.Connect(a)
+
+	cleanup, err := stack.ConnectL3(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
 
 	hc := &http.Client{
 		Transport: &http.Transport{DialContext: client.DialContext},
@@ -215,39 +193,31 @@ func TestNamespaceInternetAccess(t *testing.T) {
 	t.Logf("downloaded %d bytes from GitHub via namespace", len(body))
 }
 
-// TestNamespaceDeleteCleansConnections verifies that deleting a namespace
+// TestNamespaceDeleteCleansConnections verifies that cleaning up a namespace
 // tears down active connections.
 func TestNamespaceDeleteCleansConnections(t *testing.T) {
-	p := slirp.NewProvider(slirp.ProviderConfig{
-		Addr: netip.MustParsePrefix("10.88.0.1/24"),
-	})
-	defer p.Close()
-
-	ns, _ := p.Create("ephemeral")
-	hub := pktkit.NewL2Hub()
-	hub.Connect(ns.Device())
+	stack := slirp.New()
+	defer stack.Close()
+	stack.SetAddr(netip.MustParsePrefix("10.88.0.1/24"))
 
 	client := vclient.New()
 	defer client.Close()
 	client.SetIP(net.IPv4(10, 88, 0, 2), net.CIDRMask(24, 32), net.IPv4(10, 88, 0, 1))
-	a := pktkit.NewL2Adapter(client, nil)
-	defer a.Close()
-	hub.Connect(a)
 
-	// Start a listener to verify it gets cleaned up.
+	cleanup, err := stack.ConnectL3(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start a listener to verify cleanup doesn't panic.
 	ln, err := client.Listen("tcp", "0.0.0.0:7777")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
 
-	// Delete the namespace — should not panic or leak.
-	if err := p.Delete("ephemeral"); err != nil {
+	// Cleanup the namespace — should not panic or leak.
+	if err := cleanup(); err != nil {
 		t.Fatal(err)
-	}
-
-	// Namespace should be gone.
-	if ns := p.Get("ephemeral"); ns != nil {
-		t.Error("namespace should be nil after delete")
 	}
 }

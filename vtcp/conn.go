@@ -147,6 +147,12 @@ type Conn struct {
 	// Outgoing packet queue (drain outside mutex)
 	outgoing [][]byte
 
+	// Trampoline: prevents stack overflow from synchronous mutual recursion
+	// (e.g. two vclients on the same L2Hub). When flushing is true, outgoing
+	// packets are re-queued instead of flushed inline; the outer flush loop
+	// drains them. Zero overhead on the normal (non-recursive) path.
+	flushing atomic.Bool
+
 	// Lifecycle
 	closed          atomic.Bool
 	established     chan struct{}
@@ -249,12 +255,38 @@ func (c *Conn) drainOutgoing() [][]byte {
 	return pkts
 }
 
+// Flush sends outgoing packets via the Writer, with a trampoline to prevent
+// stack overflow from synchronous mutual recursion (e.g. two vclients on the
+// same L2Hub). Callers should use this instead of iterating Writer() directly.
+func (c *Conn) Flush(pkts [][]byte) {
+	c.flushPackets(pkts)
+}
+
 func (c *Conn) flushPackets(pkts [][]byte) {
-	for _, pkt := range pkts {
-		if c.writer != nil {
-			_ = c.writer(pkt)
-		}
+	if len(pkts) == 0 {
+		return
 	}
+	if !c.flushing.CompareAndSwap(false, true) {
+		// Re-entrant: the Writer callback recursed back into this Conn
+		// (e.g. two vclients on the same L2Hub). Re-queue and let the
+		// outer flush loop drain them — bounded stack depth, zero alloc
+		// on the normal path.
+		c.mu.Lock()
+		c.outgoing = append(c.outgoing, pkts...)
+		c.mu.Unlock()
+		return
+	}
+	for len(pkts) > 0 {
+		for _, pkt := range pkts {
+			if c.writer != nil {
+				_ = c.writer(pkt)
+			}
+		}
+		c.mu.Lock()
+		pkts = c.drainOutgoing()
+		c.mu.Unlock()
+	}
+	c.flushing.Store(false)
 }
 
 // --- Segment builders ---
@@ -388,20 +420,17 @@ func (c *Conn) AcceptSYN(syn Segment) [][]byte {
 		return nil
 	}
 
-	// Parse SYN options
 	if mss := GetMSS(syn.Options); mss > 0 && int(mss) < c.mss {
 		c.mss = int(mss)
 	}
 	c.negotiateOptions(syn.Options)
 
-	// Initialize sequence numbers
 	iss := randUint32()
 	c.sendBuf = NewSendBuf(c.sendBufCap, iss)
-	c.recvBuf = NewRecvBuf(syn.Seq+1, c.recvBufCap) // SYN consumed 1 seq
+	c.recvBuf = NewRecvBuf(syn.Seq+1, c.recvBufCap)
 
 	c.state = StateSynReceived
 
-	// Build SYN-ACK
 	synack := Segment{
 		SrcPort: c.localPort,
 		DstPort: c.remotePort,
@@ -412,9 +441,8 @@ func (c *Conn) AcceptSYN(syn Segment) [][]byte {
 		Options: c.buildSYNOptions(),
 	}
 	c.queueSeg(synack)
-	c.sendBuf.AdvanceSent(1) // SYN consumes 1 seq
+	c.sendBuf.AdvanceSent(1)
 
-	// Fix 7A: buffer any data in the SYN (RFC 9293 §3.10.7.2)
 	if len(syn.Payload) > 0 {
 		c.recvBuf.Insert(syn.Seq+1, syn.Payload)
 	}
@@ -434,8 +462,6 @@ func (c *Conn) AcceptSYN(syn Segment) [][]byte {
 //   - ourISS: our initial sequence number (the cookie value)
 //   - mss: the negotiated MSS from the cookie
 //   - initialData: any data carried in the completing ACK (may be nil)
-//
-// Returns outgoing packets (an ACK confirming the connection).
 func (c *Conn) AcceptCookie(remoteSeq, ourISS uint32, mss uint16, initialData []byte) [][]byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -448,12 +474,9 @@ func (c *Conn) AcceptCookie(remoteSeq, ourISS uint32, mss uint16, initialData []
 		c.mss = int(mss)
 	}
 
-	// SYN cookie mode: no window scaling, SACK, or timestamps negotiated.
-	c.sendBuf = NewSendBuf(c.sendBufCap, ourISS+1) // SYN was ACKed → UNA = ISS+1
+	c.sendBuf = NewSendBuf(c.sendBufCap, ourISS+1)
 	c.recvBuf = NewRecvBuf(remoteSeq, c.recvBufCap)
-
-	// Mark the SYN as both sent and acknowledged.
-	c.sendBuf.AdvanceSent(0) // NXT already at ISS+1
+	c.sendBuf.AdvanceSent(0)
 
 	c.state = StateEstablished
 	c.safeCloseEstablished()
@@ -462,12 +485,10 @@ func (c *Conn) AcceptCookie(remoteSeq, ourISS uint32, mss uint16, initialData []
 		c.startKeepalive()
 	}
 
-	// Buffer any data from the completing ACK.
 	if len(initialData) > 0 {
 		c.recvBuf.Insert(remoteSeq, initialData)
 	}
 
-	// Send an ACK to confirm we received their handshake completion.
 	ack := Segment{
 		SrcPort: c.localPort,
 		DstPort: c.remotePort,
@@ -614,22 +635,13 @@ func (c *Conn) HandleSegment(seg Segment) [][]byte {
 
 	switch c.state {
 	case StateClosed:
-		// Fix 7B: RST for segments arriving at CLOSED (RFC 9293 §3.10.7.1)
 		pkts = c.handleClosed(seg)
 
 	case StateSynSent:
-		// SYN-SENT has its own processing order (RFC 9293 §3.10.7.2)
 		pkts = c.handleSynSent(seg)
 
 	case StateSynReceived, StateEstablished, StateFinWait1, StateFinWait2,
 		StateCloseWait, StateClosing, StateLastAck, StateTimeWait:
-		// All synchronized states follow RFC 9293 §3.10.7.4 check order:
-		// 1. Sequence number check
-		// 2. RST check
-		// 3. (Security — skipped)
-		// 4. SYN check
-		// 5. ACK check
-		// 6-8. Process data, FIN, etc.
 		pkts = c.handleSynchronized(seg)
 	}
 
@@ -1613,6 +1625,12 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.readDeadline.Store(t)
 	c.recvCond.Broadcast()
 	return nil
+}
+
+// Established returns a channel that is closed when the connection
+// reaches the ESTABLISHED state (three-way handshake complete).
+func (c *Conn) Established() <-chan struct{} {
+	return c.established
 }
 
 func (c *Conn) SetWriteDeadline(t time.Time) error {

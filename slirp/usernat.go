@@ -353,26 +353,27 @@ func (s *Stack) handleIPv4(ns uint64, ip []byte) error {
 					MSS:       1460,
 					Keepalive: true,
 				})
-				pkts := vc.AcceptSYN(seg)
 				s.virtTCP[k] = vc
 				s.mu.Unlock()
-				for _, pkt := range pkts {
-					_ = vc.Writer()(pkt)
-				}
-
-				select {
-				case listener.acceptCh <- vc:
-				case <-listener.closeCh:
-					vc.Abort()
-					s.mu.Lock()
-					delete(s.virtTCP, k)
-					s.mu.Unlock()
-				default:
-					vc.Abort()
-					s.mu.Lock()
-					delete(s.virtTCP, k)
-					s.mu.Unlock()
-				}
+				vc.Flush(vc.AcceptSYN(seg))
+				go func() {
+					select {
+					case <-vc.Established():
+						select {
+						case listener.acceptCh <- vc:
+						case <-listener.closeCh:
+							vc.Abort()
+							s.mu.Lock()
+							delete(s.virtTCP, k)
+							s.mu.Unlock()
+						}
+					case <-listener.closeCh:
+						vc.Abort()
+						s.mu.Lock()
+						delete(s.virtTCP, k)
+						s.mu.Unlock()
+					}
+				}()
 				return nil
 			}
 			seg, err := vtcp.ParseSegment(tcp)
@@ -381,10 +382,7 @@ func (s *Stack) handleIPv4(ns uint64, ip []byte) error {
 				return err
 			}
 			s.mu.Unlock()
-			pkts := vc.HandleSegment(seg)
-			for _, pkt := range pkts {
-				_ = vc.Writer()(pkt)
-			}
+			vc.HandleSegment(seg)
 			return nil
 		}
 
@@ -398,10 +396,7 @@ func (s *Stack) handleIPv4(ns uint64, ip []byte) error {
 				return err
 			}
 			s.mu.Unlock()
-			pkts := vc.HandleSegment(seg)
-			for _, pkt := range pkts {
-				_ = vc.Writer()(pkt)
-			}
+			vc.Flush(vc.HandleSegment(seg))
 			return nil
 		}
 
@@ -414,10 +409,7 @@ func (s *Stack) handleIPv4(ns uint64, ip []byte) error {
 				return err
 			}
 			s.mu.Unlock()
-			pkts := c.vc.HandleSegment(seg)
-			for _, pkt := range pkts {
-				_ = c.vc.Writer()(pkt)
-			}
+			c.vc.Flush(c.vc.HandleSegment(seg))
 			return nil
 		}
 
@@ -445,12 +437,9 @@ func (s *Stack) handleIPv4(ns uint64, ip []byte) error {
 							MSS:       int(mss),
 							Keepalive: true,
 						})
-						pkts := vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload)
 						s.virtTCP[k] = vc
 						s.mu.Unlock()
-						for _, pkt := range pkts {
-							_ = vc.Writer()(pkt)
-						}
+						vc.Flush(vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload))
 						select {
 						case cookieListener.acceptCh <- vc:
 						case <-cookieListener.closeCh:
@@ -538,16 +527,11 @@ func (s *Stack) handleIPv4(ns uint64, ip []byte) error {
 			MSS:       1460,
 			Keepalive: true,
 		})
-		synAckPkts := natVC.AcceptSYN(seg)
 		nc := &tcpNATConn{vc: natVC, remote: remote}
-
 		s.tcp[k] = nc
 		s.mu.Unlock()
 
-		for _, pkt := range synAckPkts {
-			_ = natVC.Writer()(pkt)
-		}
-
+		natVC.Flush(natVC.AcceptSYN(seg))
 		nc.startBridge()
 		return nil
 	case 17: // UDP

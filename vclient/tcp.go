@@ -42,9 +42,7 @@ func (tc *TCPConn) SetReadDeadline(t time.Time) error  { return tc.vc.SetReadDea
 func (tc *TCPConn) SetWriteDeadline(t time.Time) error { return tc.vc.SetWriteDeadline(t) }
 
 func (tc *TCPConn) abort() {
-	for _, pkt := range tc.vc.Abort() {
-		_ = tc.vc.Writer()(pkt)
-	}
+	tc.vc.Flush(tc.vc.Abort())
 }
 
 // handleTCP dispatches incoming TCP segments to the appropriate connection.
@@ -69,10 +67,7 @@ func (c *Client) handleTCP(ip []byte, ihl int) error {
 		if err != nil {
 			return nil
 		}
-		pkts := conn.vc.HandleSegment(seg)
-		for _, pkt := range pkts {
-			_ = conn.vc.Writer()(pkt)
-		}
+		conn.vc.Flush(conn.vc.HandleSegment(seg))
 		return nil
 	}
 
@@ -132,37 +127,35 @@ func (c *Client) handleTCP(ip []byte, ihl int) error {
 		Keepalive: true,
 	})
 
-	synAckPkts := vc.AcceptSYN(seg)
 	tc := &TCPConn{vc: vc, c: c, k: k}
 
 	c.tcpMu.Lock()
 	c.tcpConns[k] = tc
 	c.tcpMu.Unlock()
 
-	// Send SYN-ACK
-	for _, pkt := range synAckPkts {
-		_ = vc.Writer()(pkt)
-	}
+	vc.Flush(vc.AcceptSYN(seg))
 
-	// Queue for Accept()
-	select {
-	case l.acceptCh <- tc:
-	case <-l.closeCh:
-		for _, pkt := range tc.vc.Abort() {
-			_ = vc.Writer()(pkt)
+	// Queue for Accept() only after the three-way handshake completes.
+	// The ACK may be queued by the trampoline (flushing flag) rather than
+	// sent immediately, so the connection might still be in SYN-RECEIVED.
+	go func() {
+		select {
+		case <-vc.Established():
+			select {
+			case l.acceptCh <- tc:
+			case <-l.closeCh:
+				tc.vc.Flush(tc.vc.Abort())
+				c.tcpMu.Lock()
+				delete(c.tcpConns, k)
+				c.tcpMu.Unlock()
+			}
+		case <-l.closeCh:
+			tc.vc.Flush(tc.vc.Abort())
+			c.tcpMu.Lock()
+			delete(c.tcpConns, k)
+			c.tcpMu.Unlock()
 		}
-		c.tcpMu.Lock()
-		delete(c.tcpConns, k)
-		c.tcpMu.Unlock()
-	default:
-		// Accept queue full — use SYN cookies for the next SYN instead.
-		for _, pkt := range tc.vc.Abort() {
-			_ = vc.Writer()(pkt)
-		}
-		c.tcpMu.Lock()
-		delete(c.tcpConns, k)
-		c.tcpMu.Unlock()
-	}
+	}()
 
 	return nil
 }
@@ -189,10 +182,7 @@ func (c *Client) handleTCP6(ip []byte) error {
 		if err != nil {
 			return nil
 		}
-		pkts := conn.vc.HandleSegment(seg)
-		for _, pkt := range pkts {
-			_ = conn.vc.Writer()(pkt)
-		}
+		conn.vc.Flush(conn.vc.HandleSegment(seg))
 		return nil
 	}
 
@@ -252,38 +242,33 @@ func (c *Client) handleTCP6(ip []byte) error {
 		Keepalive: true,
 	})
 
-	synAckPkts := vc.AcceptSYN(seg)
 	tc := &TCPConn{vc: vc, c: c, k6: k, v6: true}
 
 	c.tcpMu.Lock()
 	c.tcpConns6[k] = tc
 	c.tcpMu.Unlock()
 
-	// Send SYN-ACK
-	for _, pkt := range synAckPkts {
-		_ = vc.Writer()(pkt)
-	}
+	vc.Flush(vc.AcceptSYN(seg))
 
-	// Queue for Accept()
-	select {
-	case l.acceptCh <- tc:
-	case <-l.closeCh:
-		// Listener closed — abort and send RST
-		for _, pkt := range tc.vc.Abort() {
-			_ = vc.Writer()(pkt)
+	// Queue for Accept() only after the three-way handshake completes.
+	go func() {
+		select {
+		case <-vc.Established():
+			select {
+			case l.acceptCh <- tc:
+			case <-l.closeCh:
+				tc.vc.Flush(tc.vc.Abort())
+				c.tcpMu.Lock()
+				delete(c.tcpConns6, k)
+				c.tcpMu.Unlock()
+			}
+		case <-l.closeCh:
+			tc.vc.Flush(tc.vc.Abort())
+			c.tcpMu.Lock()
+			delete(c.tcpConns6, k)
+			c.tcpMu.Unlock()
 		}
-		c.tcpMu.Lock()
-		delete(c.tcpConns6, k)
-		c.tcpMu.Unlock()
-	default:
-		// Accept queue full — abort and send RST
-		for _, pkt := range tc.vc.Abort() {
-			_ = vc.Writer()(pkt)
-		}
-		c.tcpMu.Lock()
-		delete(c.tcpConns6, k)
-		c.tcpMu.Unlock()
-	}
+	}()
 
 	return nil
 }
@@ -363,23 +348,23 @@ func (c *Client) acceptCookieConn4(seg vtcp.Segment, k connKey, dstIP, srcIP [4]
 		Keepalive: true,
 	})
 
-	pkts := vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload)
 	tc := &TCPConn{vc: vc, c: c, k: k}
 
 	c.tcpMu.Lock()
 	c.tcpConns[k] = tc
 	c.tcpMu.Unlock()
 
-	for _, pkt := range pkts {
-		_ = vc.Writer()(pkt)
-	}
+	vc.Flush(vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload))
 
 	select {
 	case l.acceptCh <- tc:
 	case <-l.closeCh:
-		for _, pkt := range tc.vc.Abort() {
-			_ = vc.Writer()(pkt)
-		}
+		tc.vc.Flush(tc.vc.Abort())
+		c.tcpMu.Lock()
+		delete(c.tcpConns, k)
+		c.tcpMu.Unlock()
+	default:
+		tc.vc.Flush(tc.vc.Abort())
 		c.tcpMu.Lock()
 		delete(c.tcpConns, k)
 		c.tcpMu.Unlock()
@@ -404,23 +389,23 @@ func (c *Client) acceptCookieConn6(seg vtcp.Segment, k connKey6, dstIP, srcIP [1
 		Keepalive: true,
 	})
 
-	pkts := vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload)
 	tc := &TCPConn{vc: vc, c: c, k6: k, v6: true}
 
 	c.tcpMu.Lock()
 	c.tcpConns6[k] = tc
 	c.tcpMu.Unlock()
 
-	for _, pkt := range pkts {
-		_ = vc.Writer()(pkt)
-	}
+	vc.Flush(vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload))
 
 	select {
 	case l.acceptCh <- tc:
 	case <-l.closeCh:
-		for _, pkt := range tc.vc.Abort() {
-			_ = vc.Writer()(pkt)
-		}
+		tc.vc.Flush(tc.vc.Abort())
+		c.tcpMu.Lock()
+		delete(c.tcpConns6, k)
+		c.tcpMu.Unlock()
+	default:
+		tc.vc.Flush(tc.vc.Abort())
 		c.tcpMu.Lock()
 		delete(c.tcpConns6, k)
 		c.tcpMu.Unlock()

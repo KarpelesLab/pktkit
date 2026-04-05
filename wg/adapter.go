@@ -16,8 +16,8 @@ type AdapterConfig struct {
 	PrivateKey NoisePrivateKey
 
 	// Connector wires each peer's L3Device to the network. Use a
-	// [slirp.Provider] for per-peer isolated NAT. Exactly one of
-	// Connector or L2Connector must be set.
+	// [slirp.Stack] or [nat.NAT] for per-peer namespace-isolated NAT.
+	// Exactly one of Connector or L2Connector must be set.
 	Connector pktkit.L3Connector
 
 	// L2Connector wires each peer as an L2Device on a shared network.
@@ -41,9 +41,9 @@ type AdapterConfig struct {
 // completes a handshake gets a per-peer L3Device connected to the
 // configured connector.
 //
-// With an [pktkit.L3Connector] (e.g. [slirp.Provider]): each peer gets
-// its own isolated NAT stack. Decrypted IP packets flow directly between
-// the WireGuard tunnel and the NAT engine — no L2 framing overhead.
+// With an [pktkit.L3Connector] (e.g. [slirp.Stack]): each peer gets
+// a namespace-isolated NAT connection. Decrypted IP packets flow directly
+// between the WireGuard tunnel and the NAT engine — no L2 framing overhead.
 //
 // With an [pktkit.L2Connector] (e.g. [*pktkit.L2Hub]): each peer's
 // L3Device is wrapped in an L2Adapter for Ethernet framing on a shared

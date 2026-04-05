@@ -154,27 +154,27 @@ func (s *Stack) handleIPv6TCP(ns uint64, packet []byte, srcIP, dstIP [16]byte, t
 				MSS:       1440,
 				Keepalive: true,
 			})
-			pkts := vc.AcceptSYN(seg)
 			s.virtTCP6[k] = vc
 			s.mu.Unlock()
-			for _, pkt := range pkts {
-				_ = vc.Writer()(pkt)
-			}
-			select {
-			case listener.acceptCh <- vc:
-			case <-listener.closeCh:
-				// Listener closed — abort connection
-				vc.Abort()
-				s.mu.Lock()
-				delete(s.virtTCP6, k)
-				s.mu.Unlock()
-			default:
-				// Accept queue full — clean up
-				vc.Abort()
-				s.mu.Lock()
-				delete(s.virtTCP6, k)
-				s.mu.Unlock()
-			}
+			vc.Flush(vc.AcceptSYN(seg))
+			go func() {
+				select {
+				case <-vc.Established():
+					select {
+					case listener.acceptCh <- vc:
+					case <-listener.closeCh:
+						vc.Abort()
+						s.mu.Lock()
+						delete(s.virtTCP6, k)
+						s.mu.Unlock()
+					}
+				case <-listener.closeCh:
+					vc.Abort()
+					s.mu.Lock()
+					delete(s.virtTCP6, k)
+					s.mu.Unlock()
+				}
+			}()
 			return nil
 		}
 		// Retransmitted SYN
@@ -184,10 +184,7 @@ func (s *Stack) handleIPv6TCP(ns uint64, packet []byte, srcIP, dstIP [16]byte, t
 			return err
 		}
 		s.mu.Unlock()
-		pkts := vc.HandleSegment(seg)
-		for _, pkt := range pkts {
-			_ = vc.Writer()(pkt)
-		}
+		vc.Flush(vc.HandleSegment(seg))
 		return nil
 	}
 
@@ -201,10 +198,7 @@ func (s *Stack) handleIPv6TCP(ns uint64, packet []byte, srcIP, dstIP [16]byte, t
 			return err
 		}
 		s.mu.Unlock()
-		pkts := vc.HandleSegment(seg)
-		for _, pkt := range pkts {
-			_ = vc.Writer()(pkt)
-		}
+		vc.Flush(vc.HandleSegment(seg))
 		return nil
 	}
 
@@ -217,10 +211,7 @@ func (s *Stack) handleIPv6TCP(ns uint64, packet []byte, srcIP, dstIP [16]byte, t
 			return err
 		}
 		s.mu.Unlock()
-		pkts := c.vc.HandleSegment(seg)
-		for _, pkt := range pkts {
-			_ = c.vc.Writer()(pkt)
-		}
+		c.vc.Flush(c.vc.HandleSegment(seg))
 		return nil
 	}
 
@@ -247,12 +238,9 @@ func (s *Stack) handleIPv6TCP(ns uint64, packet []byte, srcIP, dstIP [16]byte, t
 						MSS:       int(mss),
 						Keepalive: true,
 					})
-					pkts := vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload)
 					s.virtTCP6[k] = vc
 					s.mu.Unlock()
-					for _, pkt := range pkts {
-						_ = vc.Writer()(pkt)
-					}
+					vc.Flush(vc.AcceptCookie(seg.Seq, seg.Ack-1, mss, seg.Payload))
 					select {
 					case cookieListener.acceptCh <- vc:
 					case <-cookieListener.closeCh:
@@ -344,15 +332,11 @@ func (s *Stack) handleIPv6TCP(ns uint64, packet []byte, srcIP, dstIP [16]byte, t
 		MSS:       1440,
 		Keepalive: true,
 	})
-	synAckPkts := vc6.AcceptSYN(seg)
 	nc := &tcpNATConn{vc: vc6, remote: remote}
-
 	s.tcp6[k] = nc
 	s.mu.Unlock()
 
-	for _, pkt := range synAckPkts {
-		_ = vc6.Writer()(pkt)
-	}
+	vc6.Flush(vc6.AcceptSYN(seg))
 	nc.startBridge()
 	return nil
 }
