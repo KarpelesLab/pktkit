@@ -173,6 +173,21 @@ All data-plane hot paths are zero-allocation. Benchmarks on an i9-14900K (32 thr
 | PRF 1.2 (256 B) | 3497 | 73 MB/s | 25 |
 | Options parse | 721 | - | 4 |
 
+### End-to-end VPN over UDP loopback (1400 B payload)
+
+Both benchmarks use real UDP sockets on 127.0.0.1, measuring the full
+encrypt → send → recv → decrypt pipeline.
+
+| Path | WireGuard (ChaCha20-Poly1305) | OpenVPN (AES-256-GCM) |
+|------|-----------------------------:|---------------------:|
+| One-way | 27.9 us / 50 MB/s | 11.8 us / 118 MB/s |
+| Roundtrip | 30.9 us / 45 MB/s | 26.4 us / 53 MB/s |
+
+OpenVPN GCM is faster end-to-end on x86 because AES-GCM uses AES-NI
+hardware acceleration, while ChaCha20-Poly1305 is a software cipher.
+On platforms without AES-NI (e.g. ARM without crypto extensions),
+WireGuard's ChaCha20 is typically faster.
+
 Run benchmarks with `go test -bench=. -benchmem ./...`.
 
 ## License
