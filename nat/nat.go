@@ -47,7 +47,7 @@ type natRevKey struct {
 type natMapping struct {
 	key         natKey
 	outsidePort uint16
-	lastActive  time.Time
+	lastActive  int64 // UnixNano, updated from coarse clock
 	finSeen     bool
 	finTime     time.Time
 }
@@ -68,9 +68,17 @@ type NAT struct {
 	reverse      map[natRevKey]*natMapping
 	nextPort     uint16
 	helpers      []Helper
+	helperCount  atomic.Int32 // fast path: skip helper lock when 0
 	forwards     map[natRevKey]*PortForward
 	expectations []Expectation
 	defragger    atomic.Pointer[Defragger]
+
+	// Coarse clock updated every 250ms for lastActive timestamps.
+	// Avoids a time.Now() syscall per packet on the hot path.
+	coarseNow atomic.Int64 // UnixNano
+
+	// Buffer pool for packet copies (avoids per-packet allocation).
+	pktPool sync.Pool
 
 	// Namespace-aware inside sides (for ConnectL3).
 	nsMu      sync.RWMutex
@@ -89,15 +97,59 @@ func New(insideAddr, outsideAddr netip.Prefix) *NAT {
 		nextPort: natPortMin,
 		nsSides:  make(map[uint64]*natNsSide),
 		done:     make(chan struct{}),
+		pktPool: sync.Pool{
+			New: func() any {
+				buf := make([]byte, 1536)
+				return &buf
+			},
+		},
 	}
+	n.coarseNow.Store(time.Now().UnixNano())
 	n.inside.nat = n
 	n.inside.isInside = true
 	n.inside.addr.Store(insideAddr)
 	n.outside.nat = n
 	n.outside.isInside = false
 	n.outside.addr.Store(outsideAddr)
+	go n.coarseClock()
 	go n.maintenance()
 	return n
+}
+
+// coarseClock updates the coarse timestamp every 250ms.
+func (n *NAT) coarseClock() {
+	t := time.NewTicker(250 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.done:
+			return
+		case now := <-t.C:
+			n.coarseNow.Store(now.UnixNano())
+		}
+	}
+}
+
+// nowCoarse returns the coarse cached timestamp.
+func (n *NAT) nowCoarse() int64 {
+	return n.coarseNow.Load()
+}
+
+// allocPacket returns a packet buffer from the pool, sized to pktLen.
+func (n *NAT) allocPacket(pktLen int) (pktkit.Packet, *[]byte) {
+	bufp := n.pktPool.Get().(*[]byte)
+	buf := *bufp
+	if cap(buf) < pktLen {
+		buf = make([]byte, pktLen)
+		*bufp = buf
+	}
+	return pktkit.Packet(buf[:pktLen]), bufp
+}
+
+// freePacket returns a packet buffer to the pool.
+func (n *NAT) freePacket(bufp *[]byte) {
+	*bufp = (*bufp)[:cap(*bufp)]
+	n.pktPool.Put(bufp)
 }
 
 // Inside returns the L3Device facing the private network.
@@ -113,6 +165,7 @@ func (n *NAT) Close() error {
 		n.mu.Lock()
 		helpers := n.helpers
 		n.helpers = nil
+		n.helperCount.Store(0)
 		if d := n.defragger.Swap(nil); d != nil {
 			d.Close()
 		}
@@ -330,7 +383,7 @@ func (n *NAT) handleOutboundTCPUDP(ns uint64, pkt pktkit.Packet, ihl int, proto 
 		}
 	}
 
-	out := make(pktkit.Packet, len(pkt))
+	out, bufp := n.allocPacket(len(pkt))
 	copy(out, pkt)
 
 	oldSrcIP := [4]byte(out[12:16])
@@ -356,6 +409,7 @@ func (n *NAT) handleOutboundTCPUDP(ns uint64, pkt pktkit.Packet, ihl int, proto 
 	out = n.helperOutbound(out, m, proto, dstPort)
 
 	n.outside.send(out)
+	n.freePacket(bufp)
 }
 
 func (n *NAT) handleOutboundICMP(ns uint64, pkt pktkit.Packet, ihl int) {
@@ -374,7 +428,7 @@ func (n *NAT) handleOutboundICMP(ns uint64, pkt pktkit.Packet, ihl int) {
 	}
 
 	outsideIP := n.outside.Addr().Addr()
-	out := make(pktkit.Packet, len(pkt))
+	out, bufp := n.allocPacket(len(pkt))
 	copy(out, pkt)
 
 	oldSrcIP := [4]byte(out[12:16])
@@ -388,6 +442,7 @@ func (n *NAT) handleOutboundICMP(ns uint64, pkt pktkit.Packet, ihl int) {
 	updateICMPChecksum(out, ihl, oldID, m.outsidePort)
 
 	n.outside.send(out)
+	n.freePacket(bufp)
 }
 
 // --- Inbound: outside → inside ---
@@ -433,10 +488,11 @@ func (n *NAT) handleInboundTCPUDP(pkt pktkit.Packet, ihl int, proto uint8) {
 	srcIP := netip.AddrFrom4([4]byte(pkt[12:16]))
 
 	rk := natRevKey{proto: proto, port: dstPort}
+	nowTS := n.nowCoarse()
 	n.mu.Lock()
 	m := n.reverse[rk]
 	if m != nil {
-		m.lastActive = time.Now()
+		m.lastActive = nowTS
 	}
 	// No existing mapping — check expectations and port forwards.
 	if m == nil {
@@ -447,7 +503,7 @@ func (n *NAT) handleInboundTCPUDP(pkt pktkit.Packet, ihl int, proto uint8) {
 			m = &natMapping{
 				key:         k,
 				outsidePort: dstPort,
-				lastActive:  time.Now(),
+				lastActive:  nowTS,
 			}
 			n.mappings[k] = m
 			n.reverse[rk] = m
@@ -460,7 +516,7 @@ func (n *NAT) handleInboundTCPUDP(pkt pktkit.Packet, ihl int, proto uint8) {
 			m = &natMapping{
 				key:         k,
 				outsidePort: dstPort,
-				lastActive:  time.Now(),
+				lastActive:  nowTS,
 			}
 			n.mappings[k] = m
 			n.reverse[rk] = m
@@ -483,7 +539,7 @@ func (n *NAT) handleInboundTCPUDP(pkt pktkit.Packet, ihl int, proto uint8) {
 		}
 	}
 
-	out := make(pktkit.Packet, len(pkt))
+	out, bufp := n.allocPacket(len(pkt))
 	copy(out, pkt)
 
 	oldDstIP := [4]byte(out[16:20])
@@ -509,6 +565,7 @@ func (n *NAT) handleInboundTCPUDP(pkt pktkit.Packet, ihl int, proto uint8) {
 	out = n.helperInbound(out, m, proto, origDstPort)
 
 	n.sendInside(m.key.ns, out)
+	n.freePacket(bufp)
 }
 
 func (n *NAT) handleInboundICMP(pkt pktkit.Packet, ihl int) {
@@ -521,14 +578,14 @@ func (n *NAT) handleInboundICMP(pkt pktkit.Packet, ihl int) {
 		n.mu.Lock()
 		m := n.reverse[rk]
 		if m != nil {
-			m.lastActive = time.Now()
+			m.lastActive = n.nowCoarse()
 		}
 		n.mu.Unlock()
 		if m == nil {
 			return
 		}
 
-		out := make(pktkit.Packet, len(pkt))
+		out, bufp := n.allocPacket(len(pkt))
 		copy(out, pkt)
 
 		oldDstIP := [4]byte(out[16:20])
@@ -542,6 +599,7 @@ func (n *NAT) handleInboundICMP(pkt pktkit.Packet, ihl int) {
 		updateICMPChecksum(out, ihl, oldID, m.key.port)
 
 		n.sendInside(m.key.ns, out)
+		n.freePacket(bufp)
 
 	case 3, 11, 12: // Dest Unreachable, Time Exceeded, Parameter Problem
 		n.handleInboundICMPError(pkt, ihl)
@@ -579,14 +637,14 @@ func (n *NAT) handleInboundICMPError(pkt pktkit.Packet, outerIHL int) {
 	n.mu.Lock()
 	m := n.reverse[rk]
 	if m != nil {
-		m.lastActive = time.Now()
+		m.lastActive = n.nowCoarse()
 	}
 	n.mu.Unlock()
 	if m == nil {
 		return
 	}
 
-	out := make(pktkit.Packet, len(pkt))
+	out, bufp := n.allocPacket(len(pkt))
 	copy(out, pkt)
 
 	// Rewrite outer destination IP to inside client.
@@ -612,16 +670,18 @@ func (n *NAT) handleInboundICMPError(pkt pktkit.Packet, outerIHL int) {
 	binary.BigEndian.PutUint16(icmpData[2:4], pktkit.Checksum(icmpData))
 
 	n.sendInside(m.key.ns, out)
+	n.freePacket(bufp)
 }
 
 // --- Mapping management ---
 
 func (n *NAT) getOrCreateMapping(k natKey) *natMapping {
+	nowTS := n.nowCoarse()
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	if m, ok := n.mappings[k]; ok {
-		m.lastActive = time.Now()
+		m.lastActive = nowTS
 		return m
 	}
 
@@ -633,7 +693,7 @@ func (n *NAT) getOrCreateMapping(k natKey) *natMapping {
 	m := &natMapping{
 		key:         k,
 		outsidePort: port,
-		lastActive:  time.Now(),
+		lastActive:  nowTS,
 	}
 	n.mappings[k] = m
 	n.reverse[natRevKey{proto: k.proto, port: port}] = m
@@ -674,6 +734,7 @@ func (n *NAT) maintenance() {
 		case <-ticker.C:
 		}
 		now := time.Now()
+		nowNano := now.UnixNano()
 		n.mu.Lock()
 		for k, m := range n.mappings {
 			var timeout time.Duration
@@ -691,7 +752,7 @@ func (n *NAT) maintenance() {
 			default:
 				timeout = natUDPTimeout
 			}
-			if timeout == 0 || now.Sub(m.lastActive) > timeout {
+			if timeout == 0 || nowNano-m.lastActive > int64(timeout) {
 				delete(n.mappings, k)
 				delete(n.reverse, natRevKey{proto: k.proto, port: m.outsidePort})
 			}
