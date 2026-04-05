@@ -560,7 +560,7 @@ func TestTimestampReplayProtection(t *testing.T) {
 	}
 	client.handshakesMutex.Unlock()
 
-	initPkt2, err := client.InitiateHandshake(server.PublicKey())
+	_, err = client.InitiateHandshake(server.PublicKey())
 	if err != nil {
 		t.Fatalf("second InitiateHandshake: %v", err)
 	}
@@ -575,7 +575,7 @@ func TestTimestampReplayProtection(t *testing.T) {
 	}
 	client.handshakesMutex.Unlock()
 
-	initPkt2, err = client.InitiateHandshake(server.PublicKey())
+	initPkt2, err := client.InitiateHandshake(server.PublicKey())
 	if err != nil {
 		t.Fatalf("third InitiateHandshake: %v", err)
 	}

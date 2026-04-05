@@ -43,14 +43,6 @@ func (s *l2Spy) count() int {
 	return len(s.received)
 }
 
-func (s *l2Spy) last() Frame {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.received) == 0 {
-		return nil
-	}
-	return s.received[len(s.received)-1]
-}
 
 func TestL2Hub_Flood_UnknownUnicast(t *testing.T) {
 	hub := NewL2Hub()

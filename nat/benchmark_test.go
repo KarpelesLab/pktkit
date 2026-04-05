@@ -2,7 +2,6 @@ package nat
 
 import (
 	"encoding/binary"
-	"net"
 	"net/netip"
 	"testing"
 
@@ -261,11 +260,4 @@ func BenchmarkUpdateIPChecksum(b *testing.B) {
 		// Reverse to keep the packet valid for next iteration.
 		updateIPChecksum(pkt, newSrc, oldSrc)
 	}
-}
-
-// emptyHandler is a reusable no-op handler to avoid capturing closures.
-var emptyHandler = func(pkt pktkit.Packet) error { return nil }
-
-func init() {
-	_ = net.IPv4(0, 0, 0, 0) // ensure net is used
 }

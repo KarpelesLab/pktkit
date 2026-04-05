@@ -161,13 +161,6 @@ type messageResponse struct {
 	MAC2      [blake2s.Size128]byte
 }
 
-type messageCookieReply struct {
-	Type     uint32
-	Receiver uint32
-	Nonce    [chacha20poly1305.NonceSizeX]byte
-	Cookie   [blake2s.Size128 + chacha20poly1305.Overhead]byte
-}
-
 // Handshake state enumeration
 type handshakeState int
 

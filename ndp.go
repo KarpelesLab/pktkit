@@ -163,38 +163,6 @@ func buildNeighborAdvertisement(srcMAC net.HardwareAddr, targetAddr netip.Addr, 
 	return buf
 }
 
-// buildRouterAdvertisement builds an ICMPv6 Router Advertisement.
-func buildRouterAdvertisement(srcMAC net.HardwareAddr, prefix netip.Prefix, lifetime uint16) []byte {
-	// RA: type(1)+code(1)+csum(2)+hopLimit(1)+flags(1)+routerLifetime(2)+
-	//     reachableTime(4)+retransTimer(4) = 16 bytes
-	// + source link-layer option: 8 bytes
-	// + prefix info option: 32 bytes
-	buf := make([]byte, 56)
-	buf[0] = icmpv6RouterAdvertisement
-	buf[1] = 0  // code
-	buf[4] = 64 // cur hop limit
-	// flags = 0 (no M, no O for now)
-	binary.BigEndian.PutUint16(buf[6:8], lifetime) // router lifetime
-
-	// Source link-layer address option
-	buf[16] = ndpOptSourceLinkAddr
-	buf[17] = 1
-	copy(buf[18:24], srcMAC)
-
-	// Prefix Information option (type=3, len=4 = 32 bytes)
-	buf[24] = ndpOptPrefixInfo
-	buf[25] = 4 // length in 8-byte units
-	buf[26] = byte(prefix.Bits())
-	buf[27] = 0xC0 // L + A flags (on-link + autonomous)
-	binary.BigEndian.PutUint32(buf[28:32], uint32(lifetime)*2) // valid lifetime
-	binary.BigEndian.PutUint32(buf[32:36], uint32(lifetime))   // preferred lifetime
-	// reserved 4 bytes (36-39)
-	p := prefix.Addr().As16()
-	copy(buf[40:56], p[:])
-
-	return buf
-}
-
 // wrapICMPv6 wraps an ICMPv6 payload in an IPv6 packet, computing the checksum.
 func wrapICMPv6(src, dst netip.Addr, icmpPayload []byte) []byte {
 	// Set checksum to zero, compute, then set.

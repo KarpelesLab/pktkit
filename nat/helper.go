@@ -57,13 +57,6 @@ type Expectation struct {
 	Expires    time.Time
 }
 
-// expectKey is used to match incoming connections against expectations.
-type expectKey struct {
-	proto      uint8
-	remoteIP   netip.Addr
-	remotePort uint16
-}
-
 // PortForward is a static port mapping configured on the NAT.
 type PortForward struct {
 	Proto       uint8
