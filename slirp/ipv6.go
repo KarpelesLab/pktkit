@@ -10,6 +10,7 @@ import (
 
 // key6 represents a connection key for IPv6
 type key6 struct {
+	ns      uint64
 	srcIP   [16]byte
 	srcPort uint16
 	dstIP   [16]byte
@@ -17,7 +18,7 @@ type key6 struct {
 }
 
 // handleIPv6 processes an IPv6 packet
-func (s *Stack) handleIPv6(packet []byte) error {
+func (s *Stack) handleIPv6(ns uint64, packet []byte) error {
 	// IPv6 header is fixed 40 bytes
 	if len(packet) < 40 {
 		return errors.New("IPv6 packet too short")
@@ -51,19 +52,19 @@ func (s *Stack) handleIPv6(packet []byte) error {
 		if len(packet) < transportOff+20 {
 			return nil
 		}
-		return s.handleIPv6TCP(packet, srcIP, dstIP, transportOff)
+		return s.handleIPv6TCP(ns, packet, srcIP, dstIP, transportOff)
 
 	case 17: // UDP
 		if len(packet) < transportOff+8 {
 			return nil
 		}
-		return s.handleIPv6UDP(packet, srcIP, dstIP, transportOff)
+		return s.handleIPv6UDP(ns, packet, srcIP, dstIP, transportOff)
 
 	case 58: // ICMPv6
 		if len(packet) < transportOff+8 {
 			return nil
 		}
-		return s.handleICMPv6(packet, srcIP, dstIP, transportOff)
+		return s.handleICMPv6ns(ns, packet, srcIP, dstIP, transportOff)
 
 	default:
 		// Unsupported protocol
@@ -98,7 +99,7 @@ func skipExtensionHeaders(packet []byte, nextHeader uint8, offset int) (proto ui
 	}
 }
 
-func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff int) error {
+func (s *Stack) handleIPv6TCP(ns uint64, packet []byte, srcIP, dstIP [16]byte, transportOff int) error {
 	tcp := packet[transportOff:]
 	if len(tcp) < 20 {
 		return nil
@@ -116,8 +117,9 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 		// Fallback: check wildcard listener (::)
 		listener = s.listeners6[listenerKey6{port: dstPort}]
 	}
+	sendNs := func(pkt []byte) error { return s.sendTo(ns, pkt) }
 	if listener != nil && (flags&0x02) != 0 { // SYN to virtual listener
-		k := key6{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
+		k := key6{ns: ns, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 		vc := s.virtTCP6[k]
 		if vc == nil {
 			// Use SYN cookies when the accept queue is nearly full.
@@ -130,7 +132,7 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 				s.mu.Unlock()
 				synack := s.syncookies.GenerateSYNACK(seg, dstPort, 1440)
 				pkt := buildPacket6(dstIP, srcIP, synack.Marshal())
-				_ = s.send(pkt)
+				_ = sendNs(pkt)
 				return nil
 			}
 
@@ -147,7 +149,7 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 				LocalAddr:  localAddr,
 				RemoteAddr: remoteAddr,
 				Writer: func(tcpSeg []byte) error {
-					return s.send(buildPacket6(dstIP, srcIP, tcpSeg))
+					return sendNs(buildPacket6(dstIP, srcIP, tcpSeg))
 				},
 				MSS:       1440,
 				Keepalive: true,
@@ -190,7 +192,7 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 	}
 
 	// Check if this is for an existing virtual connection
-	k := key6{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
+	k := key6{ns: ns, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 	vc := s.virtTCP6[k]
 	if vc != nil {
 		seg, err := vtcp.ParseSegment(tcp)
@@ -240,7 +242,7 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 						LocalAddr:  localAddr,
 						RemoteAddr: remoteAddr,
 						Writer: func(tcpSeg []byte) error {
-							return s.send(buildPacket6(dstIP, srcIP, tcpSeg))
+							return sendNs(buildPacket6(dstIP, srcIP, tcpSeg))
 						},
 						MSS:       int(mss),
 						Keepalive: true,
@@ -292,7 +294,7 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 			rstSeg = &vtcp.Segment{SrcPort: dstPort, DstPort: srcPort, Seq: 0, Ack: segSEQ + dataLen, Flags: vtcp.FlagRST | vtcp.FlagACK}
 		}
 		pkt := buildPacket6(dstIP, srcIP, rstSeg.Marshal())
-		_ = s.send(pkt)
+		_ = sendNs(pkt)
 		return nil
 	}
 
@@ -319,7 +321,7 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 		s.mu.Unlock()
 		rst := buildPacket6(dstIP, srcIP,
 			(&vtcp.Segment{SrcPort: dstPort, DstPort: srcPort, Ack: seg.Seq + 1, Flags: vtcp.FlagRST | vtcp.FlagACK}).Marshal())
-		_ = s.send(rst)
+		_ = sendNs(rst)
 		return nil
 	}
 	// Another goroutine may have created the connection while we were dialing
@@ -337,7 +339,7 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 		LocalAddr:  localAddr6,
 		RemoteAddr: remoteAddr6,
 		Writer: func(tcpSeg []byte) error {
-			return s.send(buildPacket6(dstIP, srcIP, tcpSeg))
+			return sendNs(buildPacket6(dstIP, srcIP, tcpSeg))
 		},
 		MSS:       1440,
 		Keepalive: true,
@@ -355,7 +357,7 @@ func (s *Stack) handleIPv6TCP(packet []byte, srcIP, dstIP [16]byte, transportOff
 	return nil
 }
 
-func (s *Stack) handleIPv6UDP(packet []byte, srcIP, dstIP [16]byte, transportOff int) error {
+func (s *Stack) handleIPv6UDP(ns uint64, packet []byte, srcIP, dstIP [16]byte, transportOff int) error {
 	udp := packet[transportOff:]
 	if len(udp) < 8 {
 		return nil
@@ -364,14 +366,14 @@ func (s *Stack) handleIPv6UDP(packet []byte, srcIP, dstIP [16]byte, transportOff
 	srcPort := binary.BigEndian.Uint16(udp[0:2])
 	dstPort := binary.BigEndian.Uint16(udp[2:4])
 
-	// Create connection key
-	k := key6{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
+	k := key6{ns: ns, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
+	sendNs := func(pkt []byte) error { return s.sendTo(ns, pkt) }
 
 	s.mu.Lock()
 	u := s.udp6[k]
 	if u == nil {
 		var err error
-		u, err = newUDPConn6(srcIP, srcPort, dstIP, dstPort, s.send)
+		u, err = newUDPConn6(srcIP, srcPort, dstIP, dstPort, sendNs)
 		if err != nil {
 			s.mu.Unlock()
 			return err

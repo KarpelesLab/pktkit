@@ -15,6 +15,7 @@ import (
 )
 
 type key struct {
+	ns      uint64 // namespace ID (0 = legacy single-device mode)
 	srcIP   [4]byte
 	srcPort uint16
 	dstIP   [4]byte
@@ -25,6 +26,10 @@ type key struct {
 // Packets received via Send are routed to real network connections (NAT)
 // or to virtual listeners. Responses are sent via the handler set with
 // SetHandler.
+//
+// For multi-tenant use, call [Stack.ConnectL3] to create namespace-isolated
+// inside L3Devices. Each namespace's connections are tracked independently,
+// allowing overlapping inside IPs.
 type Stack struct {
 	mu         sync.RWMutex
 	handler    atomic.Pointer[func(pktkit.Packet) error]
@@ -40,8 +45,14 @@ type Stack struct {
 	pending    map[key]struct{}
 	pending6   map[key6]struct{}
 	syncookies *vtcp.SYNCookies
-	done       chan struct{}
-	closeOnce  sync.Once
+
+	// Namespace-aware sides (for ConnectL3).
+	nsMu      sync.RWMutex
+	nsSides   map[uint64]*stackNsSide
+	nsCounter atomic.Uint64
+
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func New() *Stack {
@@ -57,6 +68,7 @@ func New() *Stack {
 		pending:    make(map[key]struct{}),
 		pending6:   make(map[key6]struct{}),
 		syncookies: vtcp.NewSYNCookies(),
+		nsSides:    make(map[uint64]*stackNsSide),
 		done:       make(chan struct{}),
 	}
 	go s.maintenance()
@@ -130,14 +142,18 @@ func (s *Stack) SetHandler(h func(pktkit.Packet) error) {
 // Send delivers an IP packet to the stack for processing.
 // Implements [pktkit.L3Device].
 func (s *Stack) Send(pkt pktkit.Packet) error {
+	return s.sendNs(0, pkt)
+}
+
+func (s *Stack) sendNs(ns uint64, pkt pktkit.Packet) error {
 	if len(pkt) < 20 {
 		return errors.New("packet too short")
 	}
 	switch pkt[0] >> 4 {
 	case 4:
-		return s.handleIPv4([]byte(pkt))
+		return s.handleIPv4(ns, []byte(pkt))
 	case 6:
-		return s.handleIPv6([]byte(pkt))
+		return s.handleIPv6(ns, []byte(pkt))
 	default:
 		return errors.New("unsupported IP version")
 	}
@@ -157,15 +173,118 @@ func (s *Stack) SetAddr(p netip.Prefix) error {
 	return nil
 }
 
-// send emits a raw IP packet via the handler.
+// send emits a raw IP packet via the default (ns=0) handler.
 func (s *Stack) send(pkt []byte) error {
+	return s.sendTo(0, pkt)
+}
+
+// sendTo routes a packet to the correct namespace's handler.
+func (s *Stack) sendTo(ns uint64, pkt []byte) error {
+	if ns == 0 {
+		if h := s.handler.Load(); h != nil {
+			return (*h)(pktkit.Packet(pkt))
+		}
+		return nil
+	}
+	s.nsMu.RLock()
+	side := s.nsSides[ns]
+	s.nsMu.RUnlock()
+	if side != nil {
+		return side.send(pkt)
+	}
+	return nil
+}
+
+// --- Namespace-aware sides ---
+
+// stackNsSide is a per-namespace L3Device created by ConnectL3.
+type stackNsSide struct {
+	stack   *Stack
+	ns      uint64
+	handler atomic.Pointer[func(pktkit.Packet) error]
+	addr    atomic.Value // netip.Prefix
+}
+
+func (s *stackNsSide) SetHandler(h func(pktkit.Packet) error) { s.handler.Store(&h) }
+
+func (s *stackNsSide) Send(pkt pktkit.Packet) error {
+	return s.stack.sendNs(s.ns, pkt)
+}
+
+func (s *stackNsSide) Addr() netip.Prefix {
+	if v := s.addr.Load(); v != nil {
+		return v.(netip.Prefix)
+	}
+	return netip.Prefix{}
+}
+
+func (s *stackNsSide) SetAddr(p netip.Prefix) error {
+	s.addr.Store(p)
+	return nil
+}
+
+func (s *stackNsSide) Close() error { return nil }
+
+func (s *stackNsSide) send(pkt []byte) error {
 	if h := s.handler.Load(); h != nil {
 		return (*h)(pktkit.Packet(pkt))
 	}
 	return nil
 }
 
-func (s *Stack) handleIPv4(ip []byte) error {
+// ConnectL3 implements [pktkit.L3Connector]. It creates a namespace-isolated
+// L3Device on this stack. Packets from the device are tracked with a unique
+// namespace ID, so multiple devices can use overlapping IPs without conflict.
+func (s *Stack) ConnectL3(dev pktkit.L3Device) (func() error, error) {
+	nsID := s.nsCounter.Add(1)
+
+	side := &stackNsSide{stack: s, ns: nsID}
+	side.addr.Store(s.Addr())
+
+	pktkit.ConnectL3(side, dev)
+
+	s.nsMu.Lock()
+	s.nsSides[nsID] = side
+	s.nsMu.Unlock()
+
+	return func() error {
+		s.nsMu.Lock()
+		delete(s.nsSides, nsID)
+		s.nsMu.Unlock()
+		s.cleanupNamespace(nsID)
+		return nil
+	}, nil
+}
+
+// cleanupNamespace removes all connections belonging to a namespace.
+func (s *Stack) cleanupNamespace(ns uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, c := range s.tcp {
+		if k.ns == ns {
+			c.close()
+			delete(s.tcp, k)
+		}
+	}
+	for k, u := range s.udp {
+		if k.ns == ns {
+			u.mu.Lock()
+			if u.conn != nil {
+				u.conn.Close()
+			}
+			u.mu.Unlock()
+			delete(s.udp, k)
+		}
+	}
+	for k, vc := range s.virtTCP {
+		if k.ns == ns {
+			vc.Abort()
+			delete(s.virtTCP, k)
+		}
+	}
+}
+
+func (s *Stack) handleIPv4(ns uint64, ip []byte) error {
 	if len(ip) < 20 {
 		return errors.New("IPv4 packet too short")
 	}
@@ -180,7 +299,7 @@ func (s *Stack) handleIPv4(ip []byte) error {
 
 	switch proto {
 	case 1: // ICMP
-		return s.handleICMPv4(ip, srcIP, dstIP, ihl)
+		return s.handleICMPv4ns(ns, ip, srcIP, dstIP, ihl)
 	case 6: // TCP
 		if len(ip) < ihl+20 {
 			return nil
@@ -198,12 +317,11 @@ func (s *Stack) handleIPv4(ip []byte) error {
 			// Fallback: check wildcard listener (0.0.0.0)
 			listener = s.listeners[listenerKey{port: dstPort}]
 		}
+		sendNs := func(pkt []byte) error { return s.sendTo(ns, pkt) }
 		if listener != nil && (flags&0x02) != 0 { // SYN to virtual listener
-			k := key{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
+			k := key{ns: ns, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 			vc := s.virtTCP[k]
 			if vc == nil {
-				// If the accept queue is nearly full, use SYN cookies to avoid
-				// allocating state until the handshake completes.
 				if len(listener.acceptCh) >= cap(listener.acceptCh)-1 {
 					seg, err := vtcp.ParseSegment(tcp)
 					if err != nil {
@@ -213,11 +331,10 @@ func (s *Stack) handleIPv4(ip []byte) error {
 					s.mu.Unlock()
 					synack := s.syncookies.GenerateSYNACK(seg, dstPort, 1460)
 					pkt := buildPacket4(dstIP, srcIP, synack.Marshal())
-					_ = s.send(pkt)
+					_ = sendNs(pkt)
 					return nil
 				}
 
-				// Normal path: create a vtcp.Conn.
 				seg, err := vtcp.ParseSegment(tcp)
 				if err != nil {
 					s.mu.Unlock()
@@ -231,7 +348,7 @@ func (s *Stack) handleIPv4(ip []byte) error {
 					LocalAddr:  localAddr,
 					RemoteAddr: remoteAddr,
 					Writer: func(tcpSeg []byte) error {
-						return s.send(buildPacket4(dstIP, srcIP, tcpSeg))
+						return sendNs(buildPacket4(dstIP, srcIP, tcpSeg))
 					},
 					MSS:       1460,
 					Keepalive: true,
@@ -246,13 +363,11 @@ func (s *Stack) handleIPv4(ip []byte) error {
 				select {
 				case listener.acceptCh <- vc:
 				case <-listener.closeCh:
-					// Listener closed — abort connection
 					vc.Abort()
 					s.mu.Lock()
 					delete(s.virtTCP, k)
 					s.mu.Unlock()
 				default:
-					// Accept queue full — clean up
 					vc.Abort()
 					s.mu.Lock()
 					delete(s.virtTCP, k)
@@ -260,7 +375,6 @@ func (s *Stack) handleIPv4(ip []byte) error {
 				}
 				return nil
 			}
-			// Retransmitted SYN — HandleSegment will respond with SYN-ACK
 			seg, err := vtcp.ParseSegment(tcp)
 			if err != nil {
 				s.mu.Unlock()
@@ -275,7 +389,7 @@ func (s *Stack) handleIPv4(ip []byte) error {
 		}
 
 		// Check if this is for an existing virtual connection
-		k := key{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
+		k := key{ns: ns, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
 		vc := s.virtTCP[k]
 		if vc != nil {
 			seg, err := vtcp.ParseSegment(tcp)
@@ -326,7 +440,7 @@ func (s *Stack) handleIPv4(ip []byte) error {
 							LocalAddr:  localAddr,
 							RemoteAddr: remoteAddr,
 							Writer: func(tcpSeg []byte) error {
-								return s.send(buildPacket4(dstIP, srcIP, tcpSeg))
+								return sendNs(buildPacket4(dstIP, srcIP, tcpSeg))
 							},
 							MSS:       int(mss),
 							Keepalive: true,
@@ -361,24 +475,22 @@ func (s *Stack) handleIPv4(ip []byte) error {
 			s.mu.Unlock()
 			var rstSeg *vtcp.Segment
 			if (flags & 0x10) != 0 {
-				// Incoming has ACK: send RST with SEQ=SEG.ACK (no ACK flag)
 				segACK := binary.BigEndian.Uint32(tcp[8:12])
 				rstSeg = &vtcp.Segment{SrcPort: dstPort, DstPort: srcPort, Seq: segACK, Flags: vtcp.FlagRST}
 			} else {
-				// No ACK: send RST+ACK with SEQ=0, ACK=SEG.SEQ+SEG.LEN
 				segSEQ := binary.BigEndian.Uint32(tcp[4:8])
 				dataOff := int(tcp[12]>>4) * 4
 				if dataOff > len(tcp) {
 					dataOff = len(tcp)
 				}
 				dataLen := uint32(len(tcp) - dataOff)
-				if (tcp[13] & 0x01) != 0 { // FIN flag
+				if (tcp[13] & 0x01) != 0 {
 					dataLen++
 				}
 				rstSeg = &vtcp.Segment{SrcPort: dstPort, DstPort: srcPort, Seq: 0, Ack: segSEQ + dataLen, Flags: vtcp.FlagRST | vtcp.FlagACK}
 			}
 			pkt := buildPacket4(dstIP, srcIP, rstSeg.Marshal())
-			_ = s.send(pkt)
+			_ = sendNs(pkt)
 			return nil
 		}
 
@@ -388,7 +500,6 @@ func (s *Stack) handleIPv4(ip []byte) error {
 			s.mu.Unlock()
 			return err
 		}
-		// Check if a dial is already in progress for this key
 		if _, dup := s.pending[k]; dup {
 			s.mu.Unlock()
 			return nil
@@ -396,7 +507,6 @@ func (s *Stack) handleIPv4(ip []byte) error {
 		s.pending[k] = struct{}{}
 		s.mu.Unlock()
 
-		// Dial remote outside any lock
 		remoteAddr := net.IP(dstIP[:]).String() + ":" + itoaU16(dstPort)
 		remote, err := net.Dial("tcp", remoteAddr)
 
@@ -404,13 +514,11 @@ func (s *Stack) handleIPv4(ip []byte) error {
 		delete(s.pending, k)
 		if err != nil {
 			s.mu.Unlock()
-			// Send RST to client
 			rst := buildPacket4(dstIP, srcIP,
 				(&vtcp.Segment{SrcPort: dstPort, DstPort: srcPort, Ack: seg.Seq + 1, Flags: vtcp.FlagRST | vtcp.FlagACK}).Marshal())
-			_ = s.send(rst)
+			_ = sendNs(rst)
 			return nil
 		}
-		// Another goroutine may have created the connection while we were dialing
 		if s.tcp[k] != nil {
 			s.mu.Unlock()
 			_ = remote.Close()
@@ -425,7 +533,7 @@ func (s *Stack) handleIPv4(ip []byte) error {
 			LocalAddr:  localAddr,
 			RemoteAddr: remoteClientAddr,
 			Writer: func(tcpSeg []byte) error {
-				return s.send(buildPacket4(dstIP, srcIP, tcpSeg))
+				return sendNs(buildPacket4(dstIP, srcIP, tcpSeg))
 			},
 			MSS:       1460,
 			Keepalive: true,
@@ -436,12 +544,10 @@ func (s *Stack) handleIPv4(ip []byte) error {
 		s.tcp[k] = nc
 		s.mu.Unlock()
 
-		// Send SYN-ACK
 		for _, pkt := range synAckPkts {
 			_ = natVC.Writer()(pkt)
 		}
 
-		// Start bidirectional bridge
 		nc.startBridge()
 		return nil
 	case 17: // UDP
@@ -451,12 +557,13 @@ func (s *Stack) handleIPv4(ip []byte) error {
 		udp := ip[ihl:]
 		srcPort := binary.BigEndian.Uint16(udp[0:2])
 		dstPort := binary.BigEndian.Uint16(udp[2:4])
-		k := key{srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
+		k := key{ns: ns, srcIP: srcIP, srcPort: srcPort, dstIP: dstIP, dstPort: dstPort}
+		sendNs := func(pkt []byte) error { return s.sendTo(ns, pkt) }
 		s.mu.Lock()
 		u := s.udp[k]
 		if u == nil {
 			var err error
-			u, err = newUDPConn(srcIP, srcPort, dstIP, dstPort, s.send)
+			u, err = newUDPConn(srcIP, srcPort, dstIP, dstPort, sendNs)
 			if err != nil {
 				s.mu.Unlock()
 				return err

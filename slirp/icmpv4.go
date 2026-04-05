@@ -2,10 +2,15 @@ package slirp
 
 import "encoding/binary"
 
-// handleICMPv4 processes IPv4 ICMP packets. Only echo requests destined
-// for the stack's own IP are answered; everything else is silently dropped
-// (forwarding ICMP to the real network requires raw sockets / root).
+// handleICMPv4 processes IPv4 ICMP packets (legacy ns=0 path).
 func (s *Stack) handleICMPv4(ip []byte, srcIP, dstIP [4]byte, ihl int) error {
+	return s.handleICMPv4ns(0, ip, srcIP, dstIP, ihl)
+}
+
+// handleICMPv4ns processes IPv4 ICMP packets with namespace routing.
+// Only echo requests destined for the stack's own IP are answered;
+// everything else is silently dropped.
+func (s *Stack) handleICMPv4ns(ns uint64, ip []byte, srcIP, dstIP [4]byte, ihl int) error {
 	icmp := ip[ihl:]
 	if len(icmp) < 8 {
 		return nil
@@ -50,7 +55,7 @@ func (s *Stack) handleICMPv4(ip []byte, srcIP, dstIP [4]byte, ihl int) error {
 	binary.BigEndian.PutUint16(reply[10:12], 0)
 	binary.BigEndian.PutUint16(reply[10:12], ipv4HeaderChecksum(reply[:ihl]))
 
-	return s.send(reply)
+	return s.sendTo(ns, reply)
 }
 
 // icmpChecksum computes the Internet checksum over the given data.

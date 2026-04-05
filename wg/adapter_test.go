@@ -10,23 +10,20 @@ import (
 	"time"
 
 	"github.com/KarpelesLab/pktkit"
-	"github.com/KarpelesLab/pktkit/nat"
 	"github.com/KarpelesLab/pktkit/slirp"
 	"github.com/KarpelesLab/pktkit/vclient"
 	"github.com/KarpelesLab/pktkit/wg"
 )
 
-// TestAdapterNATConnectL3 verifies that ConnectL3 on a nat.NAT creates
-// namespace-isolated mappings and cleans them up on peer removal.
-func TestAdapterNATConnectL3(t *testing.T) {
-	n := nat.New(
-		netip.MustParsePrefix("10.0.0.1/24"),
-		netip.MustParsePrefix("100.64.0.2/24"),
-	)
-	defer n.Close()
+// TestAdapterConnectL3 verifies that ConnectL3 creates namespace-isolated
+// connections and cleans them up on peer removal.
+func TestAdapterConnectL3(t *testing.T) {
+	stack := slirp.New()
+	defer stack.Close()
+	stack.SetAddr(netip.MustParsePrefix("10.0.0.1/24"))
 
 	serverAdapter, err := wg.NewAdapter(wg.AdapterConfig{
-		Connector: n,
+		Connector: stack,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -86,14 +83,12 @@ func TestAdapterNATConnectL3(t *testing.T) {
 
 // TestAdapterPeerLifecycle verifies peer setup and removal.
 func TestAdapterPeerLifecycle(t *testing.T) {
-	n := nat.New(
-		netip.MustParsePrefix("10.0.0.1/24"),
-		netip.MustParsePrefix("100.64.0.2/24"),
-	)
-	defer n.Close()
+	stack := slirp.New()
+	defer stack.Close()
+	stack.SetAddr(netip.MustParsePrefix("10.0.0.1/24"))
 
 	adapter, err := wg.NewAdapter(wg.AdapterConfig{
-		Connector: n,
+		Connector: stack,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -116,16 +111,14 @@ func TestAdapterPeerLifecycle(t *testing.T) {
 
 // TestAdapterUnknownPeer verifies dynamic peer authorization via OnUnknownPeer.
 func TestAdapterUnknownPeer(t *testing.T) {
-	n := nat.New(
-		netip.MustParsePrefix("10.0.0.1/24"),
-		netip.MustParsePrefix("100.64.0.2/24"),
-	)
-	defer n.Close()
+	stack := slirp.New()
+	defer stack.Close()
+	stack.SetAddr(netip.MustParsePrefix("10.0.0.1/24"))
 
 	unknownCh := make(chan wg.NoisePublicKey, 1)
 
 	adapter, err := wg.NewAdapter(wg.AdapterConfig{
-		Connector: n,
+		Connector: stack,
 		OnUnknownPeer: func(key wg.NoisePublicKey, addr *net.UDPAddr, packet []byte) {
 			unknownCh <- key
 		},
@@ -171,33 +164,22 @@ func TestAdapterUnknownPeer(t *testing.T) {
 // TestWireGuardNATIsolation is the full end-to-end test with the topology:
 //
 //	Client 1 (vclient 10.0.0.2) ──WG──┐
-//	                                    ├── WG Server ── NAT ── slirp ── Internet
+//	                                    ├── WG Server ── slirp (namespace-isolated) ── Internet
 //	Client 2 (vclient 10.0.0.2) ──WG──┘
 //
-// A single nat.NAT with namespace-aware connection tracking isolates both
-// clients even though they share the same IP. The NAT's outside is wired
-// to a slirp stack for real internet access.
+// A single slirp.Stack with namespace-aware connection tracking isolates
+// both clients even though they share the same IP.
 func TestWireGuardNATIsolation(t *testing.T) {
 	// --- Server side ---
-	// slirp stack provides internet access on the outside.
+	// slirp stack with namespace-aware ConnectL3.
 	stack := slirp.New()
 	defer stack.Close()
-	stack.SetAddr(netip.MustParsePrefix("100.64.0.1/24"))
+	stack.SetAddr(netip.MustParsePrefix("10.0.0.1/24"))
 
-	// NAT: inside 10.0.0.1/24 (VPN clients), outside 100.64.0.2/24 (slirp LAN).
-	n := nat.New(
-		netip.MustParsePrefix("10.0.0.1/24"),
-		netip.MustParsePrefix("100.64.0.2/24"),
-	)
-	defer n.Close()
-
-	// Wire NAT outside ↔ slirp stack.
-	pktkit.ConnectL3(n.Outside(), stack)
-
-	// WireGuard adapter uses NAT as L3Connector — each peer gets a
-	// namespace-isolated inside device on the same NAT instance.
+	// WireGuard adapter uses slirp.Stack as L3Connector — each peer gets
+	// a namespace-isolated connection on the same Stack.
 	serverAdapter, err := wg.NewAdapter(wg.AdapterConfig{
-		Connector: n,
+		Connector: stack,
 	})
 	if err != nil {
 		t.Fatal(err)

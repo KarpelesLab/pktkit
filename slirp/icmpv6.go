@@ -14,9 +14,13 @@ const (
 	ICMPv6TypeNeighborAdvertisement = 136
 )
 
-// handleICMPv6 processes ICMPv6 packets. transportOff is the byte offset
-// where the ICMPv6 header begins (after any extension headers).
+// handleICMPv6 processes ICMPv6 packets (legacy ns=0 path).
 func (s *Stack) handleICMPv6(packet []byte, srcIP, dstIP [16]byte, transportOff int) error {
+	return s.handleICMPv6ns(0, packet, srcIP, dstIP, transportOff)
+}
+
+// handleICMPv6ns processes ICMPv6 packets with namespace routing.
+func (s *Stack) handleICMPv6ns(ns uint64, packet []byte, srcIP, dstIP [16]byte, transportOff int) error {
 	if len(packet) < transportOff+8 {
 		return nil
 	}
@@ -30,7 +34,7 @@ func (s *Stack) handleICMPv6(packet []byte, srcIP, dstIP [16]byte, transportOff 
 
 	switch icmpType {
 	case ICMPv6TypeEchoRequest:
-		return s.handleICMPv6EchoRequest(packet, srcIP, dstIP, transportOff)
+		return s.handleICMPv6EchoRequestNs(ns, packet, srcIP, dstIP, transportOff)
 
 	case ICMPv6TypeRouterSolicitation:
 		// Router Solicitation - typically we ignore this in a NAT context
@@ -45,8 +49,8 @@ func (s *Stack) handleICMPv6(packet []byte, srcIP, dstIP [16]byte, transportOff 
 	}
 }
 
-// handleICMPv6EchoRequest handles ping6 requests
-func (s *Stack) handleICMPv6EchoRequest(packet []byte, srcIP, dstIP [16]byte, transportOff int) error {
+// handleICMPv6EchoRequestNs handles ping6 requests with namespace routing.
+func (s *Stack) handleICMPv6EchoRequestNs(ns uint64, packet []byte, srcIP, dstIP [16]byte, transportOff int) error {
 	if len(packet) < transportOff+8 {
 		return nil
 	}
@@ -80,5 +84,5 @@ func (s *Stack) handleICMPv6EchoRequest(packet []byte, srcIP, dstIP [16]byte, tr
 	copy(pkt, ip)
 	copy(pkt[len(ip):], replyICMP)
 
-	return s.send(pkt)
+	return s.sendTo(ns, pkt)
 }
