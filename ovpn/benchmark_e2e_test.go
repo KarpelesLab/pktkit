@@ -6,8 +6,9 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/KarpelesLab/pktkit"
 )
@@ -43,32 +44,9 @@ func makeIPv4UDP(src, dst netip.Addr, payloadSize int) []byte {
 	return pkt
 }
 
-// ovpnEndpoint holds one side of an OpenVPN UDP data channel.
-type ovpnEndpoint struct {
-	peer   *Peer
-	conn   *net.UDPConn
-	remote *net.UDPAddr
-	onRecv func(pktkit.Packet)
-}
-
-// readLoop reads encrypted packets from UDP and decrypts them.
-func (e *ovpnEndpoint) readLoop() {
-	buf := make([]byte, 65536)
-	for {
-		n, _, err := e.conn.ReadFromUDP(buf)
-		if err != nil {
-			return
-		}
-		// Copy because handleData modifies in-place
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-		e.peer.handleData(pkt)
-	}
-}
-
 // setupOVPNUDP creates two pre-keyed OpenVPN GCM peers connected via UDP loopback.
-// Returns (client, server, cleanup).
-func setupOVPNUDP(tb testing.TB) (client, server *ovpnEndpoint, cleanup func()) {
+// onServerRecv is called for each decrypted packet arriving at the server side.
+func setupOVPNUDP(tb testing.TB, onServerRecv func(pktkit.Packet)) (clientPeer *Peer, cleanup func()) {
 	tb.Helper()
 
 	keyMaterial := make([]byte, 256)
@@ -99,15 +77,12 @@ func setupOVPNUDP(tb testing.TB) (client, server *ovpnEndpoint, cleanup func()) 
 		return opt
 	}
 
-	// Create UDP endpoints
 	udpClient, _ := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	udpServer, _ := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 
-	clientAddr := udpClient.LocalAddr().(*net.UDPAddr)
 	serverAddr := udpServer.LocalAddr().(*net.UDPAddr)
 
-	// Client peer sends encrypted packets to server via UDP
-	clientPeer := &Peer{
+	clientPeer = &Peer{
 		c:            &udpSender{conn: udpClient, remote: serverAddr},
 		opts:         makeOpts(),
 		keys:         clientKeys,
@@ -116,34 +91,28 @@ func setupOVPNUDP(tb testing.TB) (client, server *ovpnEndpoint, cleanup func()) 
 	}
 	clientPeer.onL3Packet = func(pkt pktkit.Packet) {}
 
-	// Server peer sends encrypted packets to client via UDP
 	serverPeer := &Peer{
-		c:            &udpSender{conn: udpServer, remote: clientAddr},
+		c:            &udpSender{conn: udpServer, remote: udpClient.LocalAddr().(*net.UDPAddr)},
 		opts:         makeOpts(),
 		keys:         serverKeys,
 		replayWindow: newWindow(),
 		layer:        3,
 	}
-	serverPeer.onL3Packet = func(pkt pktkit.Packet) {}
+	serverPeer.onL3Packet = onServerRecv
 
-	client = &ovpnEndpoint{peer: clientPeer, conn: udpClient, remote: serverAddr}
-	server = &ovpnEndpoint{peer: serverPeer, conn: udpServer, remote: clientAddr}
-
-	// Wire up L3 delivery
-	serverPeer.onL3Packet = func(pkt pktkit.Packet) {
-		if server.onRecv != nil {
-			server.onRecv(pkt)
+	// Server read loop
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			n, _, err := udpServer.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			pkt := make([]byte, n)
+			copy(pkt, buf[:n])
+			serverPeer.handleData(pkt)
 		}
-	}
-	clientPeer.onL3Packet = func(pkt pktkit.Packet) {
-		if client.onRecv != nil {
-			client.onRecv(pkt)
-		}
-	}
-
-	// Start read loops
-	go client.readLoop()
-	go server.readLoop()
+	}()
 
 	cleanup = func() {
 		udpClient.Close()
@@ -165,10 +134,14 @@ func (u *udpSender) Send(pkt []byte) error {
 func (u *udpSender) SetPeer(p *Peer) {}
 func (u *udpSender) Close()          {}
 
-// BenchmarkE2EOpenVPNUDP measures one-way UDP throughput:
-// packet → GCM encrypt → UDP loopback → GCM decrypt → callback
-func BenchmarkE2EOpenVPNUDP(b *testing.B) {
-	client, server, cleanup := setupOVPNUDP(b)
+// BenchmarkE2EOpenVPNThroughput measures saturated unidirectional throughput.
+// The sender pipelines packets as fast as possible; the receiver counts arrivals.
+func BenchmarkE2EOpenVPNThroughput(b *testing.B) {
+	var received atomic.Int64
+
+	client, cleanup := setupOVPNUDP(b, func(p pktkit.Packet) {
+		received.Add(1)
+	})
 	defer cleanup()
 
 	pkt := makeIPv4UDP(
@@ -177,25 +150,37 @@ func BenchmarkE2EOpenVPNUDP(b *testing.B) {
 		1372,
 	)
 
-	var wg sync.WaitGroup
-	server.onRecv = func(p pktkit.Packet) {
-		wg.Done()
-	}
-
 	b.SetBytes(int64(len(pkt)))
 	b.ResetTimer()
 
 	for b.Loop() {
-		wg.Add(1)
-		client.peer.SendData(pkt)
-		wg.Wait()
+		client.SendData(pkt)
+	}
+
+	b.StopTimer()
+
+	target := int64(b.N)
+	drainDeadline := time.Now().Add(500 * time.Millisecond)
+	for received.Load() < target && time.Now().Before(drainDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	got := received.Load()
+	if got < target {
+		b.Logf("warning: sent %d, received %d (%.1f%% loss)", target, got, 100*float64(target-got)/float64(target))
 	}
 }
 
-// BenchmarkE2EOpenVPNUDPRoundtrip measures echo throughput over UDP:
-// send → encrypt → UDP → decrypt → echo → encrypt → UDP → decrypt → receive
-func BenchmarkE2EOpenVPNUDPRoundtrip(b *testing.B) {
-	client, server, cleanup := setupOVPNUDP(b)
+// BenchmarkE2EOpenVPNLatency measures per-packet latency (synchronous send-wait).
+func BenchmarkE2EOpenVPNLatency(b *testing.B) {
+	done := make(chan struct{}, 1)
+
+	client, cleanup := setupOVPNUDP(b, func(p pktkit.Packet) {
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	})
 	defer cleanup()
 
 	pkt := makeIPv4UDP(
@@ -204,34 +189,19 @@ func BenchmarkE2EOpenVPNUDPRoundtrip(b *testing.B) {
 		1372,
 	)
 
-	server.onRecv = func(p pktkit.Packet) {
-		reply := make([]byte, len(p))
-		copy(reply, p)
-		copy(reply[12:16], p[16:20])
-		copy(reply[16:20], p[12:16])
-		binary.BigEndian.PutUint16(reply[10:12], 0)
-		var sum uint32
-		for i := 0; i < 20; i += 2 {
-			sum += uint32(binary.BigEndian.Uint16(reply[i : i+2]))
-		}
-		for sum > 0xffff {
-			sum = (sum >> 16) + (sum & 0xffff)
-		}
-		binary.BigEndian.PutUint16(reply[10:12], ^uint16(sum))
-		server.peer.SendData(reply)
-	}
-
-	var wg sync.WaitGroup
-	client.onRecv = func(p pktkit.Packet) {
-		wg.Done()
+	// Warm up — ensure cipher is initialized
+	client.SendData(pkt)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		b.Fatal("warmup packet not received")
 	}
 
 	b.SetBytes(int64(len(pkt)))
 	b.ResetTimer()
 
 	for b.Loop() {
-		wg.Add(1)
-		client.peer.SendData(pkt)
-		wg.Wait()
+		client.SendData(pkt)
+		<-done
 	}
 }

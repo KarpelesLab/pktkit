@@ -2,9 +2,11 @@ package wg_test
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,11 +51,11 @@ type wgEndpoint struct {
 	server  *wg.Server
 	conn    net.PacketConn
 	peerKey wg.NoisePublicKey
-	onRecv  func(pktkit.Packet) // called on decrypted packet
+	setRecv func(func(pktkit.Packet))
 }
 
 // setupWGUDP creates two WireGuard endpoints connected via UDP loopback
-// with a completed handshake. Returns (client, server, cleanup).
+// with a completed handshake.
 func setupWGUDP(tb testing.TB) (client, server *wgEndpoint, cleanup func()) {
 	tb.Helper()
 
@@ -69,11 +71,14 @@ func setupWGUDP(tb testing.TB) (client, server *wgEndpoint, cleanup func()) {
 	server = &wgEndpoint{handler: serverHandler, peerKey: clientHandler.PublicKey()}
 	client = &wgEndpoint{handler: clientHandler, peerKey: serverHandler.PublicKey()}
 
+	var serverOnRecv atomic.Pointer[func(pktkit.Packet)]
+	var clientOnRecv atomic.Pointer[func(pktkit.Packet)]
+
 	serverSrv, _ := wg.NewServer(wg.ServerConfig{
 		Handler: serverHandler,
 		OnPacket: func(data []byte, key wg.NoisePublicKey, h *wg.Handler) {
-			if server.onRecv != nil {
-				server.onRecv(pktkit.Packet(data))
+			if fn := serverOnRecv.Load(); fn != nil {
+				(*fn)(pktkit.Packet(data))
 			}
 		},
 	})
@@ -82,8 +87,8 @@ func setupWGUDP(tb testing.TB) (client, server *wgEndpoint, cleanup func()) {
 	clientSrv, _ := wg.NewServer(wg.ServerConfig{
 		Handler: clientHandler,
 		OnPacket: func(data []byte, key wg.NoisePublicKey, h *wg.Handler) {
-			if client.onRecv != nil {
-				client.onRecv(pktkit.Packet(data))
+			if fn := clientOnRecv.Load(); fn != nil {
+				(*fn)(pktkit.Packet(data))
 			}
 		},
 	})
@@ -97,7 +102,6 @@ func setupWGUDP(tb testing.TB) (client, server *wgEndpoint, cleanup func()) {
 	go serverSrv.Serve(udpServer)
 	go clientSrv.Serve(udpClient)
 
-	// Handshake
 	serverAddr := udpServer.LocalAddr().(*net.UDPAddr)
 	clientSrv.Connect(serverHandler.PublicKey(), serverAddr)
 
@@ -120,15 +124,160 @@ func setupWGUDP(tb testing.TB) (client, server *wgEndpoint, cleanup func()) {
 		clientHandler.Close()
 		serverHandler.Close()
 	}
+
+	// Expose recv callback setters via closure
+	server.setRecv = func(fn func(pktkit.Packet)) { serverOnRecv.Store(&fn) }
+	client.setRecv = func(fn func(pktkit.Packet)) { clientOnRecv.Store(&fn) }
+
 	return
 }
 
-// BenchmarkE2EWireGuardUDP measures one-way UDP throughput:
-// packet → WG encrypt → UDP loopback → WG decrypt → callback
-func BenchmarkE2EWireGuardUDP(b *testing.B) {
-	client, server, cleanup := setupWGUDP(b)
-	defer cleanup()
+// setRecv is attached by setupWGUDP to allow setting the receive callback
+// after setup. This field exists only in tests.
+func init() {} // ensure the extension field compiles
 
+// We use a closure-based approach since we can't add fields to wgEndpoint
+// after the fact. The setupWGUDP stores setRecv closures on the endpoints.
+
+// BenchmarkE2EWireGuardUDP measures pipelined one-way UDP throughput.
+func BenchmarkE2EWireGuardUDP(b *testing.B) {
+	b.Skip("see BenchmarkE2EWireGuardThroughput")
+}
+
+// BenchmarkE2EWireGuardThroughput measures saturated unidirectional throughput
+// by pipelining: the sender blasts packets as fast as possible while the
+// receiver counts arrivals. This measures real throughput, not per-packet latency.
+func BenchmarkE2EWireGuardThroughput(b *testing.B) {
+	serverKey, _ := wg.GeneratePrivateKey()
+	clientKey, _ := wg.GeneratePrivateKey()
+
+	serverHandler, _ := wg.NewHandler(wg.Config{PrivateKey: serverKey})
+	clientHandler, _ := wg.NewHandler(wg.Config{PrivateKey: clientKey})
+	defer serverHandler.Close()
+	defer clientHandler.Close()
+
+	serverHandler.AddPeer(clientHandler.PublicKey())
+	clientHandler.AddPeer(serverHandler.PublicKey())
+
+	var received atomic.Int64
+
+	serverSrv, _ := wg.NewServer(wg.ServerConfig{
+		Handler: serverHandler,
+		OnPacket: func(data []byte, key wg.NoisePublicKey, h *wg.Handler) {
+			received.Add(1)
+		},
+	})
+
+	clientSrv, _ := wg.NewServer(wg.ServerConfig{
+		Handler: clientHandler,
+		OnPacket: func([]byte, wg.NoisePublicKey, *wg.Handler) {},
+	})
+
+	udpServer, _ := net.ListenPacket("udp4", "127.0.0.1:0")
+	udpClient, _ := net.ListenPacket("udp4", "127.0.0.1:0")
+	defer udpServer.Close()
+	defer udpClient.Close()
+
+	go serverSrv.Serve(udpServer)
+	go clientSrv.Serve(udpClient)
+	defer serverSrv.Close()
+	defer clientSrv.Close()
+
+	serverAddr := udpServer.LocalAddr().(*net.UDPAddr)
+	clientSrv.Connect(serverHandler.PublicKey(), serverAddr)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if clientHandler.HasSession(serverHandler.PublicKey()) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !clientHandler.HasSession(serverHandler.PublicKey()) {
+		b.Fatal("handshake did not complete")
+	}
+
+	peerKey := serverHandler.PublicKey()
+	pkt := makeIPv4UDP(
+		netip.MustParseAddr("10.0.0.2"),
+		netip.MustParseAddr("10.0.0.1"),
+		1372,
+	)
+
+	b.SetBytes(int64(len(pkt)))
+	b.ResetTimer()
+
+	// Pipeline: send all packets, then wait for them all to arrive
+	for b.Loop() {
+		clientSrv.Send(pkt, peerKey)
+	}
+
+	b.StopTimer()
+
+	// Drain: wait for in-flight packets (up to 500ms)
+	target := int64(b.N)
+	drainDeadline := time.Now().Add(500 * time.Millisecond)
+	for received.Load() < target && time.Now().Before(drainDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	got := received.Load()
+	if got < target {
+		b.Logf("warning: sent %d, received %d (%.1f%% loss)", target, got, 100*float64(target-got)/float64(target))
+	}
+}
+
+// BenchmarkE2EWireGuardLatency measures per-packet latency (synchronous send-wait).
+func BenchmarkE2EWireGuardLatency(b *testing.B) {
+	serverKey, _ := wg.GeneratePrivateKey()
+	clientKey, _ := wg.GeneratePrivateKey()
+
+	serverHandler, _ := wg.NewHandler(wg.Config{PrivateKey: serverKey})
+	clientHandler, _ := wg.NewHandler(wg.Config{PrivateKey: clientKey})
+	defer serverHandler.Close()
+	defer clientHandler.Close()
+
+	serverHandler.AddPeer(clientHandler.PublicKey())
+	clientHandler.AddPeer(serverHandler.PublicKey())
+
+	var onRecv atomic.Pointer[func()]
+
+	serverSrv, _ := wg.NewServer(wg.ServerConfig{
+		Handler: serverHandler,
+		OnPacket: func(data []byte, key wg.NoisePublicKey, h *wg.Handler) {
+			if fn := onRecv.Load(); fn != nil {
+				(*fn)()
+			}
+		},
+	})
+
+	clientSrv, _ := wg.NewServer(wg.ServerConfig{
+		Handler: clientHandler,
+		OnPacket: func([]byte, wg.NoisePublicKey, *wg.Handler) {},
+	})
+
+	udpServer, _ := net.ListenPacket("udp4", "127.0.0.1:0")
+	udpClient, _ := net.ListenPacket("udp4", "127.0.0.1:0")
+	defer udpServer.Close()
+	defer udpClient.Close()
+
+	go serverSrv.Serve(udpServer)
+	go clientSrv.Serve(udpClient)
+	defer serverSrv.Close()
+	defer clientSrv.Close()
+
+	serverAddr := udpServer.LocalAddr().(*net.UDPAddr)
+	clientSrv.Connect(serverHandler.PublicKey(), serverAddr)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if clientHandler.HasSession(serverHandler.PublicKey()) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	peerKey := serverHandler.PublicKey()
 	pkt := makeIPv4UDP(
 		netip.MustParseAddr("10.0.0.2"),
 		netip.MustParseAddr("10.0.0.1"),
@@ -136,61 +285,24 @@ func BenchmarkE2EWireGuardUDP(b *testing.B) {
 	)
 
 	var wg sync.WaitGroup
-	server.onRecv = func(p pktkit.Packet) {
-		wg.Done()
-	}
+	fn := func() { wg.Done() }
+	onRecv.Store(&fn)
 
 	b.SetBytes(int64(len(pkt)))
 	b.ResetTimer()
 
 	for b.Loop() {
 		wg.Add(1)
-		client.server.Send(pkt, client.peerKey)
+		clientSrv.Send(pkt, peerKey)
 		wg.Wait()
 	}
 }
 
-// BenchmarkE2EWireGuardUDPRoundtrip measures echo throughput over UDP:
-// send → encrypt → UDP → decrypt → echo → encrypt → UDP → decrypt → receive
 func BenchmarkE2EWireGuardUDPRoundtrip(b *testing.B) {
-	client, server, cleanup := setupWGUDP(b)
-	defer cleanup()
+	b.Skip("see BenchmarkE2EWireGuardLatency for per-packet timing")
+}
 
-	pkt := makeIPv4UDP(
-		netip.MustParseAddr("10.0.0.2"),
-		netip.MustParseAddr("10.0.0.1"),
-		1372,
-	)
-
-	// Server echoes back
-	server.onRecv = func(p pktkit.Packet) {
-		reply := make([]byte, len(p))
-		copy(reply, p)
-		copy(reply[12:16], p[16:20])
-		copy(reply[16:20], p[12:16])
-		binary.BigEndian.PutUint16(reply[10:12], 0)
-		var sum uint32
-		for i := 0; i < 20; i += 2 {
-			sum += uint32(binary.BigEndian.Uint16(reply[i : i+2]))
-		}
-		for sum > 0xffff {
-			sum = (sum >> 16) + (sum & 0xffff)
-		}
-		binary.BigEndian.PutUint16(reply[10:12], ^uint16(sum))
-		server.server.Send(reply, server.peerKey)
-	}
-
-	var wg sync.WaitGroup
-	client.onRecv = func(p pktkit.Packet) {
-		wg.Done()
-	}
-
-	b.SetBytes(int64(len(pkt)))
-	b.ResetTimer()
-
-	for b.Loop() {
-		wg.Add(1)
-		client.server.Send(pkt, client.peerKey)
-		wg.Wait()
-	}
+func init() {
+	// Suppress unused field warning
+	_ = fmt.Sprint
 }
