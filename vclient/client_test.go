@@ -299,6 +299,144 @@ func TestClientListenDuplicate(t *testing.T) {
 	}
 }
 
+// TestIPv6TCPEcho tests IPv6 TCP echo between two directly connected clients.
+func TestIPv6TCPEcho(t *testing.T) {
+	serverClient := vclient.New()
+	dialClient := vclient.New()
+	pktkit.ConnectL3(serverClient, dialClient)
+	defer serverClient.Close()
+	defer dialClient.Close()
+
+	serverClient.SetIPv6(net.ParseIP("fd00::1"))
+	dialClient.SetIPv6(net.ParseIP("fd00::2"))
+
+	// Server listens on IPv6
+	ln, err := serverClient.Listen("tcp6", "[fd00::1]:9000")
+	if err != nil {
+		t.Fatal("Listen:", err)
+	}
+	defer ln.Close()
+
+	// Echo server
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					c.Write(buf[:n])
+				}
+			}(conn)
+		}
+	}()
+
+	// Client dials over IPv6
+	conn, err := dialClient.Dial("tcp6", "[fd00::1]:9000")
+	if err != nil {
+		t.Fatal("Dial:", err)
+	}
+	defer conn.Close()
+
+	testData := []byte("Hello, IPv6 virtual network!")
+	if _, err := conn.Write(testData); err != nil {
+		t.Fatal("Write:", err)
+	}
+
+	buf := make([]byte, 100)
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatal("Read:", err)
+	}
+	if string(buf[:n]) != string(testData) {
+		t.Fatalf("echo = %q, want %q", buf[:n], testData)
+	}
+}
+
+// TestIPv6UDPDial tests IPv6 UDP connection creation between two clients.
+func TestIPv6UDPDial(t *testing.T) {
+	serverClient := vclient.New()
+	dialClient := vclient.New()
+	pktkit.ConnectL3(serverClient, dialClient)
+	defer serverClient.Close()
+	defer dialClient.Close()
+
+	serverClient.SetIPv6(net.ParseIP("fd00::1"))
+	dialClient.SetIPv6(net.ParseIP("fd00::2"))
+
+	conn, err := dialClient.Dial("udp6", "[fd00::1]:12345")
+	if err != nil {
+		t.Fatal("UDP6 Dial:", err)
+	}
+	defer conn.Close()
+
+	if conn.LocalAddr() == nil {
+		t.Error("LocalAddr should not be nil")
+	}
+	if conn.RemoteAddr() == nil {
+		t.Error("RemoteAddr should not be nil")
+	}
+
+	// Write some data (we can't receive response without a listener, but
+	// verify writing doesn't panic)
+	_, err = conn.Write([]byte("test ipv6 udp"))
+	if err != nil {
+		t.Fatal("Write:", err)
+	}
+}
+
+// TestTCPConnAddrs verifies LocalAddr and RemoteAddr on a TCP connection.
+func TestTCPConnAddrs(t *testing.T) {
+	serverClient := vclient.New()
+	dialClient := vclient.New()
+	pktkit.ConnectL3(serverClient, dialClient)
+	defer serverClient.Close()
+	defer dialClient.Close()
+
+	serverClient.SetIP(net.IPv4(10, 0, 0, 1), net.IPv4Mask(255, 255, 255, 0), net.IPv4(10, 0, 0, 2))
+	dialClient.SetIP(net.IPv4(10, 0, 0, 2), net.IPv4Mask(255, 255, 255, 0), net.IPv4(10, 0, 0, 1))
+
+	ln, err := serverClient.Listen("tcp", "10.0.0.1:7777")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		conn.Close()
+	}()
+
+	conn, err := dialClient.Dial("tcp", "10.0.0.1:7777")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	local := conn.LocalAddr()
+	remote := conn.RemoteAddr()
+	if local == nil {
+		t.Fatal("LocalAddr is nil")
+	}
+	if remote == nil {
+		t.Fatal("RemoteAddr is nil")
+	}
+	if remote.String() != "10.0.0.1:7777" {
+		t.Fatalf("RemoteAddr = %v, want 10.0.0.1:7777", remote)
+	}
+}
+
 // TestClientListenClose tests that Accept returns error after Close.
 func TestClientListenClose(t *testing.T) {
 	client := vclient.New()

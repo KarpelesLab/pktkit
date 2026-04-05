@@ -2,6 +2,7 @@ package vclient
 
 import (
 	"net"
+	"net/netip"
 	"testing"
 
 	"github.com/KarpelesLab/pktkit"
@@ -107,5 +108,63 @@ func TestResolverReturnValue(t *testing.T) {
 	}
 	if !r.PreferGo {
 		t.Error("Resolver should have PreferGo=true")
+	}
+}
+
+func TestSetIPv6(t *testing.T) {
+	c := New()
+	defer c.Close()
+
+	c.SetIPv6(net.ParseIP("fd00::2"))
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	expected := [16]byte{0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
+	if c.ip6 != expected {
+		t.Fatalf("ip6 = %v, want %v", c.ip6, expected)
+	}
+}
+
+func TestSetDNS6(t *testing.T) {
+	c := New()
+	defer c.Close()
+
+	c.SetDNS6([]net.IP{net.ParseIP("2001:4860:4860::8888"), net.ParseIP("2001:4860:4860::8844")})
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.dns6) != 2 {
+		t.Fatalf("dns6 length = %d, want 2", len(c.dns6))
+	}
+}
+
+func TestSetAddrIPv4(t *testing.T) {
+	c := New()
+	defer c.Close()
+
+	prefix := netip.MustParsePrefix("10.0.0.5/24")
+	if err := c.SetAddr(prefix); err != nil {
+		t.Fatal(err)
+	}
+
+	got := c.Addr()
+	if got.Addr() != prefix.Addr() {
+		t.Fatalf("Addr() = %v, want %v", got.Addr(), prefix.Addr())
+	}
+}
+
+func TestSetAddrIPv6(t *testing.T) {
+	c := New()
+	defer c.Close()
+
+	prefix := netip.MustParsePrefix("fd00::5/64")
+	if err := c.SetAddr(prefix); err != nil {
+		t.Fatal(err)
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.addr6 != prefix {
+		t.Fatalf("addr6 = %v, want %v", c.addr6, prefix)
 	}
 }
