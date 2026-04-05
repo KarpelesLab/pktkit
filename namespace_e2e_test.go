@@ -14,8 +14,6 @@ import (
 	"github.com/KarpelesLab/pktkit/vclient"
 )
 
-// TestNamespaceIsolation verifies that two namespaces with the same IP
-// range have fully isolated traffic.
 func TestNamespaceIsolation(t *testing.T) {
 	p := slirp.NewProvider(slirp.ProviderConfig{
 		Addr: netip.MustParsePrefix("192.168.0.1/24"),

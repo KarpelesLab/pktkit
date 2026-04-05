@@ -179,6 +179,8 @@ func (s *Stack) handleIPv4(ip []byte) error {
 	copy(dstIP[:], ip[16:20])
 
 	switch proto {
+	case 1: // ICMP
+		return s.handleICMPv4(ip, srcIP, dstIP, ihl)
 	case 6: // TCP
 		if len(ip) < ihl+20 {
 			return nil

@@ -76,6 +76,10 @@ func (c *Conn) Send(f pktkit.Frame) error {
 // HWAddr returns the connection's MAC address.
 func (c *Conn) HWAddr() net.HardwareAddr { return c.mac }
 
+// Done returns a channel that is closed when the connection is closed.
+// This allows [pktkit.Serve] to detect disconnection and trigger cleanup.
+func (c *Conn) Done() <-chan struct{} { return c.done }
+
 // Close shuts down the connection and stops the read goroutine.
 func (c *Conn) Close() error {
 	var err error
@@ -87,6 +91,11 @@ func (c *Conn) Close() error {
 }
 
 func (c *Conn) readLoop() {
+	defer c.closeOnce.Do(func() {
+		close(c.done)
+		c.conn.Close()
+	})
+
 	var hdr [4]byte
 	buf := make([]byte, maxFrameSize)
 	for {
@@ -145,6 +154,12 @@ func (l *Listener) Accept() (*Conn, error) {
 		return nil, err
 	}
 	return newConn(conn), nil
+}
+
+// AcceptL2 implements [pktkit.L2Acceptor]. It accepts a connection and
+// returns it as an [pktkit.L2Device].
+func (l *Listener) AcceptL2() (pktkit.L2Device, error) {
+	return l.Accept()
 }
 
 // Close closes the listener.

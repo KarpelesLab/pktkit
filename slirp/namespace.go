@@ -2,9 +2,11 @@ package slirp
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/KarpelesLab/pktkit"
 )
@@ -138,4 +140,26 @@ func (p *Provider) Close() error {
 		}
 	}
 	return firstErr
+}
+
+var nsCounter atomic.Uint64
+
+// ConnectL2 implements [pktkit.L2Connector]. It creates a new namespace
+// with an auto-generated name, wires the device and the namespace's
+// gateway into a shared L2Hub, and returns a cleanup function that
+// deletes the namespace.
+func (p *Provider) ConnectL2(dev pktkit.L2Device) (func() error, error) {
+	name := fmt.Sprintf("auto-%d", nsCounter.Add(1))
+	ns, err := p.Create(name)
+	if err != nil {
+		return nil, err
+	}
+
+	hub := pktkit.NewL2Hub()
+	hub.Connect(ns.Device())
+	hub.Connect(dev)
+
+	return func() error {
+		return p.Delete(name)
+	}, nil
 }

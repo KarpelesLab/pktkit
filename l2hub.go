@@ -160,3 +160,10 @@ func (hh *L2HubHandle) Close() error {
 	})
 	return nil
 }
+
+// ConnectL2 implements [L2Connector]. It connects the device to the hub
+// and returns a cleanup function that disconnects it.
+func (h *L2Hub) ConnectL2(dev L2Device) (func() error, error) {
+	handle := h.Connect(dev)
+	return handle.Close, nil
+}
