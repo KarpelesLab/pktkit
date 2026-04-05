@@ -12,7 +12,7 @@ import (
 
 // MultiPacketResult extends PacketResult with the handler that processed the packet.
 type MultiPacketResult struct {
-	*PacketResult
+	PacketResult
 	Handler *Handler // which identity processed the packet
 }
 

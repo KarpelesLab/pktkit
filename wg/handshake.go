@@ -21,19 +21,19 @@ import (
 // processHandshakeInitiation processes a type-1 handshake initiation as the
 // responder. It decrypts the initiator's identity, validates MAC1/MAC2,
 // authorizes the peer, derives transport keys, and returns the response message.
-func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAddr) (*PacketResult, error) {
+func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAddr) (PacketResult, error) {
 	h.incrementActiveHandshakes()
 	defer h.decrementActiveHandshakes()
 
 	// Decode the initiation message
 	msg, err := decodeMessageInitiation(data)
 	if err != nil {
-		return nil, fmt.Errorf("decode handshake: %w", err)
+		return PacketResult{}, fmt.Errorf("decode handshake: %w", err)
 	}
 
 	// Validate MAC1 — always drop if invalid, regardless of load state.
 	if !h.cookieChecker.CheckMAC1(data) {
-		return nil, fmt.Errorf("invalid MAC1")
+		return PacketResult{}, fmt.Errorf("invalid MAC1")
 	}
 
 	// Validate MAC2 if under load
@@ -47,16 +47,16 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 			if !h.cookieChecker.CheckMAC2(data, ipBytes) {
 				cookieReply, err := h.generateCookieReply(remoteAddr.IP, msg.Sender, data[116:132])
 				if err != nil {
-					return nil, fmt.Errorf("generate cookie reply: %w", err)
+					return PacketResult{}, fmt.Errorf("generate cookie reply: %w", err)
 				}
-				return &PacketResult{Type: PacketCookieReply, Response: cookieReply}, nil
+				return PacketResult{Type: PacketCookieReply, Response: cookieReply}, nil
 			}
 		} else {
 			cookieReply, err := h.generateCookieReply(remoteAddr.IP, msg.Sender, data[116:132])
 			if err != nil {
-				return nil, fmt.Errorf("generate cookie reply: %w", err)
+				return PacketResult{}, fmt.Errorf("generate cookie reply: %w", err)
 			}
-			return &PacketResult{Type: PacketCookieReply, Response: cookieReply}, nil
+			return PacketResult{Type: PacketCookieReply, Response: cookieReply}, nil
 		}
 	}
 
@@ -81,7 +81,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	var key [chacha20poly1305.KeySize]byte
 	tempSS, err := curve25519.X25519(serverPrivateKey[:], hs.remoteEphemeral[:])
 	if err != nil {
-		return nil, fmt.Errorf("DH failed: %w", err)
+		return PacketResult{}, fmt.Errorf("DH failed: %w", err)
 	}
 
 	kdf2(&hs.chainKey, &key, hs.chainKey[:], tempSS)
@@ -91,12 +91,12 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	clientStaticKey, err := aeadCipher.Open(nil, zeroNonce[:], msg.Static[:], hs.hash[:])
 	if err != nil {
 		setZero(key[:])
-		return nil, fmt.Errorf("decrypt static key: %w", err)
+		return PacketResult{}, fmt.Errorf("decrypt static key: %w", err)
 	}
 
 	if len(clientStaticKey) != 32 {
 		setZero(key[:])
-		return nil, fmt.Errorf("invalid client static key length: %d", len(clientStaticKey))
+		return PacketResult{}, fmt.Errorf("invalid client static key length: %d", len(clientStaticKey))
 	}
 
 	copy(hs.remoteStatic[:], clientStaticKey)
@@ -106,7 +106,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	tempSS, err = curve25519.X25519(serverPrivateKey[:], hs.remoteStatic[:])
 	if err != nil {
 		setZero(key[:])
-		return nil, fmt.Errorf("static DH failed: %w", err)
+		return PacketResult{}, fmt.Errorf("static DH failed: %w", err)
 	}
 
 	copy(hs.precomputedStaticStatic[:], tempSS)
@@ -117,7 +117,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	aeadCipher, _ = chacha20poly1305.New(key[:])
 	timestamp, err := aeadCipher.Open(nil, zeroNonce[:], msg.Timestamp[:], hs.hash[:])
 	if err != nil {
-		return nil, fmt.Errorf("decrypt timestamp: %w", err)
+		return PacketResult{}, fmt.Errorf("decrypt timestamp: %w", err)
 	}
 
 	mixHash(&hs.hash, &hs.hash, msg.Timestamp[:])
@@ -127,7 +127,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 		if h.onUnknownPeer != nil {
 			h.onUnknownPeer(hs.remoteStatic, remoteAddr, data)
 		}
-		return nil, fmt.Errorf("unauthorized peer")
+		return PacketResult{}, fmt.Errorf("unauthorized peer")
 	}
 
 	// Check timestamp replay and update last handshake time
@@ -135,7 +135,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	if entry, exists := h.peers[hs.remoteStatic]; exists {
 		if entry.hasTimestamp && bytes.Compare(timestamp, entry.lastTimestamp[:]) <= 0 {
 			h.peersMutex.Unlock()
-			return nil, fmt.Errorf("replayed handshake timestamp")
+			return PacketResult{}, fmt.Errorf("replayed handshake timestamp")
 		}
 		copy(entry.lastTimestamp[:], timestamp)
 		entry.hasTimestamp = true
@@ -160,7 +160,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	// === Generate ephemeral key ===
 	hs.localEphemeral, err = GeneratePrivateKey()
 	if err != nil {
-		return nil, fmt.Errorf("generate ephemeral key: %w", err)
+		return PacketResult{}, fmt.Errorf("generate ephemeral key: %w", err)
 	}
 
 	ephemeralPub := hs.localEphemeral.PublicKey()
@@ -173,7 +173,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	// ee: ephemeral-ephemeral
 	tempSS, err = curve25519.X25519(hs.localEphemeral[:], hs.remoteEphemeral[:])
 	if err != nil {
-		return nil, fmt.Errorf("ee DH failed: %w", err)
+		return PacketResult{}, fmt.Errorf("ee DH failed: %w", err)
 	}
 	mixKey(&hs.chainKey, &hs.chainKey, tempSS)
 	setZero(tempSS)
@@ -181,7 +181,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	// se: ephemeral-static
 	tempSS, err = curve25519.X25519(hs.localEphemeral[:], hs.remoteStatic[:])
 	if err != nil {
-		return nil, fmt.Errorf("es DH failed: %w", err)
+		return PacketResult{}, fmt.Errorf("es DH failed: %w", err)
 	}
 	mixKey(&hs.chainKey, &hs.chainKey, tempSS)
 	setZero(tempSS)
@@ -196,7 +196,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	emptyData := aeadCipher.Seal(nil, zeroNonce[:], []byte{}, hs.hash[:])
 
 	if len(emptyData) != chacha20poly1305.Overhead {
-		return nil, fmt.Errorf("invalid empty data size: %d", len(emptyData))
+		return PacketResult{}, fmt.Errorf("invalid empty data size: %d", len(emptyData))
 	}
 
 	copy(respMsg.Empty[:], emptyData)
@@ -220,7 +220,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	mac1Key := calculateMAC1Key(hs.remoteStatic)
 	mac1Hasher, err := blake2s.New128(mac1Key[:])
 	if err != nil {
-		return nil, fmt.Errorf("create MAC1 hash: %w", err)
+		return PacketResult{}, fmt.Errorf("create MAC1 hash: %w", err)
 	}
 	mac1Hasher.Write(macInput)
 	mac1Hasher.Sum(respMsg.MAC1[:0])
@@ -261,7 +261,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	h.keypairsMutex.Lock()
 	if len(h.keypairs) >= maxHandshakes {
 		h.keypairsMutex.Unlock()
-		return nil, fmt.Errorf("keypair table full")
+		return PacketResult{}, fmt.Errorf("keypair table full")
 	}
 	h.keypairs[hs.localIndex] = kp
 	h.keypairsMutex.Unlock()
@@ -270,7 +270,7 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	h.sessionsMutex.Lock()
 	if len(h.sessions) >= maxSessions && h.sessions[hs.remoteStatic] == nil {
 		h.sessionsMutex.Unlock()
-		return nil, fmt.Errorf("session table full")
+		return PacketResult{}, fmt.Errorf("session table full")
 	}
 	if sess, exists := h.sessions[hs.remoteStatic]; exists {
 		sess.mutex.Lock()
@@ -292,14 +292,14 @@ func (h *Handler) processHandshakeInitiation(data []byte, remoteAddr *net.UDPAdd
 	// === Encode response ===
 	respBytes, err := encodeMessageResponse(&respMsg)
 	if err != nil {
-		return nil, fmt.Errorf("encode response: %w", err)
+		return PacketResult{}, fmt.Errorf("encode response: %w", err)
 	}
 
 	if len(respBytes) != messageResponseSize {
-		return nil, fmt.Errorf("invalid response size: %d (expected %d)", len(respBytes), messageResponseSize)
+		return PacketResult{}, fmt.Errorf("invalid response size: %d (expected %d)", len(respBytes), messageResponseSize)
 	}
 
-	return &PacketResult{
+	return PacketResult{
 		Type:     PacketHandshakeResponse,
 		Response: respBytes,
 		PeerKey:  hs.remoteStatic,
@@ -490,10 +490,10 @@ func (h *Handler) InitiateHandshake(peerKey NoisePublicKey) ([]byte, error) {
 // processing a type-2 response. It resumes the Noise state from the pending
 // handshake, derives transport keys, establishes the session, and returns a
 // keepalive as the PacketResult response (standard WireGuard behavior).
-func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
+func (h *Handler) processHandshakeResponse(data []byte) (PacketResult, error) {
 	msg, err := decodeMessageResponse(data)
 	if err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+		return PacketResult{}, fmt.Errorf("decode response: %w", err)
 	}
 
 	// Look up pending handshake by our sender index
@@ -501,12 +501,12 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 	hs, exists := h.handshakes[msg.Receiver]
 	h.handshakesMutex.RUnlock()
 	if !exists {
-		return nil, fmt.Errorf("no pending handshake for receiver index %d", msg.Receiver)
+		return PacketResult{}, fmt.Errorf("no pending handshake for receiver index %d", msg.Receiver)
 	}
 
 	// Validate MAC1 — response MAC1 is keyed on our own public key
 	if !h.cookieChecker.CheckMAC1(data) {
-		return nil, fmt.Errorf("invalid MAC1 on response")
+		return PacketResult{}, fmt.Errorf("invalid MAC1 on response")
 	}
 
 	// Resume Noise state from saved handshake
@@ -522,7 +522,7 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 	// DH ee: client_eph_priv x server_eph_pub
 	tempSS, err := curve25519.X25519(hs.localEphemeral[:], serverEphPub[:])
 	if err != nil {
-		return nil, fmt.Errorf("ee DH failed: %w", err)
+		return PacketResult{}, fmt.Errorf("ee DH failed: %w", err)
 	}
 	mixKey(&chainKey, &chainKey, tempSS)
 	setZero(tempSS)
@@ -530,7 +530,7 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 	// DH se: client_static_priv x server_eph_pub
 	tempSS, err = curve25519.X25519(h.privateKey[:], serverEphPub[:])
 	if err != nil {
-		return nil, fmt.Errorf("se DH failed: %w", err)
+		return PacketResult{}, fmt.Errorf("se DH failed: %w", err)
 	}
 	mixKey(&chainKey, &chainKey, tempSS)
 	setZero(tempSS)
@@ -545,7 +545,7 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 	setZero(key[:])
 	_, err = aeadCipher.Open(nil, zeroNonce[:], msg.Empty[:], hash[:])
 	if err != nil {
-		return nil, fmt.Errorf("decrypt empty: %w", err)
+		return PacketResult{}, fmt.Errorf("decrypt empty: %w", err)
 	}
 	mixHash(&hash, &hash, msg.Empty[:])
 
@@ -616,10 +616,10 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 	// Generate keepalive — standard WireGuard behavior after receiving response
 	keepaliveData, err := h.encryptDataPacket([]byte{}, peerKey)
 	if err != nil {
-		return nil, fmt.Errorf("generate keepalive: %w", err)
+		return PacketResult{}, fmt.Errorf("generate keepalive: %w", err)
 	}
 
-	return &PacketResult{
+	return PacketResult{
 		Type:     PacketHandshakeResponse,
 		Response: keepaliveData,
 		PeerKey:  peerKey,
@@ -628,9 +628,9 @@ func (h *Handler) processHandshakeResponse(data []byte) (*PacketResult, error) {
 
 // processCookieReply processes a type-3 cookie reply message.
 // The cookie is stored internally; the caller should retry the handshake initiation.
-func (h *Handler) processCookieReply(data []byte) (*PacketResult, error) {
+func (h *Handler) processCookieReply(data []byte) (PacketResult, error) {
 	if len(data) < messageCookieReplySize {
-		return nil, fmt.Errorf("cookie reply too short: %d", len(data))
+		return PacketResult{}, fmt.Errorf("cookie reply too short: %d", len(data))
 	}
 
 	receiverIdx := binary_le_uint32(data[4:8])
@@ -640,7 +640,7 @@ func (h *Handler) processCookieReply(data []byte) (*PacketResult, error) {
 	hs, exists := h.handshakes[receiverIdx]
 	h.handshakesMutex.RUnlock()
 	if !exists {
-		return nil, fmt.Errorf("no pending handshake for receiver index %d", receiverIdx)
+		return PacketResult{}, fmt.Errorf("no pending handshake for receiver index %d", receiverIdx)
 	}
 
 	// Get peer info for the cookie generator
@@ -648,7 +648,7 @@ func (h *Handler) processCookieReply(data []byte) (*PacketResult, error) {
 	entry, peerExists := h.peers[hs.remoteStatic]
 	h.peersMutex.RUnlock()
 	if !peerExists {
-		return nil, fmt.Errorf("no peer info for cookie reply")
+		return PacketResult{}, fmt.Errorf("no peer info for cookie reply")
 	}
 
 	// Decrypt cookie using XChaCha20-Poly1305
@@ -659,20 +659,20 @@ func (h *Handler) processCookieReply(data []byte) (*PacketResult, error) {
 	xaead, err := chacha20poly1305.NewX(entry.cookieGen.mac2.encryptionKey[:])
 	if err != nil {
 		entry.cookieGen.Unlock()
-		return nil, fmt.Errorf("create xchacha20: %w", err)
+		return PacketResult{}, fmt.Errorf("create xchacha20: %w", err)
 	}
 
 	cookie, err := xaead.Open(nil, nonce[:], data[32:messageCookieReplySize], entry.cookieGen.mac2.lastMAC1[:])
 	if err != nil {
 		entry.cookieGen.Unlock()
-		return nil, fmt.Errorf("decrypt cookie: %w", err)
+		return PacketResult{}, fmt.Errorf("decrypt cookie: %w", err)
 	}
 
 	copy(entry.cookieGen.mac2.cookie[:], cookie)
 	entry.cookieGen.mac2.cookieSet = now()
 	entry.cookieGen.Unlock()
 
-	return &PacketResult{
+	return PacketResult{
 		Type:    PacketCookieReceived,
 		PeerKey: hs.remoteStatic,
 	}, nil

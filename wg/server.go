@@ -207,7 +207,7 @@ func (s *Server) processIncoming(data []byte, addr net.Addr) {
 	}
 
 	var (
-		result  *PacketResult
+		result  PacketResult
 		handler *Handler
 		err     error
 	)
@@ -215,9 +215,6 @@ func (s *Server) processIncoming(data []byte, addr net.Addr) {
 	if s.multiHandler != nil {
 		mr, e := s.multiHandler.ProcessPacket(data, udpAddr)
 		if e != nil {
-			return
-		}
-		if mr == nil {
 			return
 		}
 		result = mr.PacketResult
@@ -228,10 +225,6 @@ func (s *Server) processIncoming(data []byte, addr net.Addr) {
 			return
 		}
 		handler = s.handler
-	}
-
-	if result == nil {
-		return
 	}
 
 	// Update peer address (skip when PeerKey is zero, e.g. cookie replies).

@@ -77,8 +77,7 @@ type NAT struct {
 	// Avoids a time.Now() syscall per packet on the hot path.
 	coarseNow atomic.Int64 // UnixNano
 
-	// Buffer pool for packet copies (avoids per-packet allocation).
-	pktPool sync.Pool
+	// (packet pool is global: pktkit.AllocBuffer / pktkit.FreeBuffer)
 
 	// Namespace-aware inside sides (for ConnectL3).
 	nsMu      sync.RWMutex
@@ -97,12 +96,6 @@ func New(insideAddr, outsideAddr netip.Prefix) *NAT {
 		nextPort: natPortMin,
 		nsSides:  make(map[uint64]*natNsSide),
 		done:     make(chan struct{}),
-		pktPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, 1536)
-				return &buf
-			},
-		},
 	}
 	n.coarseNow.Store(time.Now().UnixNano())
 	n.inside.nat = n
@@ -135,21 +128,15 @@ func (n *NAT) nowCoarse() int64 {
 	return n.coarseNow.Load()
 }
 
-// allocPacket returns a packet buffer from the pool, sized to pktLen.
+// allocPacket returns a packet buffer from the global pool, sized to pktLen.
 func (n *NAT) allocPacket(pktLen int) (pktkit.Packet, *[]byte) {
-	bufp := n.pktPool.Get().(*[]byte)
-	buf := *bufp
-	if cap(buf) < pktLen {
-		buf = make([]byte, pktLen)
-		*bufp = buf
-	}
-	return pktkit.Packet(buf[:pktLen]), bufp
+	buf, bufp := pktkit.AllocBuffer(pktLen)
+	return pktkit.Packet(buf), bufp
 }
 
-// freePacket returns a packet buffer to the pool.
+// freePacket returns a packet buffer to the global pool.
 func (n *NAT) freePacket(bufp *[]byte) {
-	*bufp = (*bufp)[:cap(*bufp)]
-	n.pktPool.Put(bufp)
+	pktkit.FreeBuffer(bufp)
 }
 
 // Inside returns the L3Device facing the private network.

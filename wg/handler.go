@@ -234,11 +234,11 @@ func (h *Handler) AcceptUnknownPeer(peerKey NoisePublicKey, initiationPacket []b
 		return fmt.Errorf("no connection set on handler")
 	}
 	h.AddPeer(peerKey)
-	result, err := h.processHandshakeInitiation(initiationPacket, remoteAddr)
+	res, err := h.processHandshakeInitiation(initiationPacket, remoteAddr)
 	if err != nil {
 		return err
 	}
-	_, err = conn.WriteTo(result.Response, remoteAddr)
+	_, err = conn.WriteTo(res.Response, remoteAddr)
 	return err
 }
 
@@ -327,9 +327,9 @@ func (h *Handler) getPresharedKey(peerKey NoisePublicKey) NoisePresharedKey {
 // It dispatches by message type: initiation (1), response (2), cookie reply (3),
 // and transport data (4). The caller is responsible for sending any Response
 // bytes back to remoteAddr.
-func (h *Handler) ProcessPacket(data []byte, remoteAddr *net.UDPAddr) (*PacketResult, error) {
+func (h *Handler) ProcessPacket(data []byte, remoteAddr *net.UDPAddr) (PacketResult, error) {
 	if len(data) < 4 {
-		return nil, fmt.Errorf("packet too short: %d bytes", len(data))
+		return PacketResult{}, fmt.Errorf("packet too short: %d bytes", len(data))
 	}
 
 	msgType := binary_le_uint32(data[0:4])
@@ -344,7 +344,7 @@ func (h *Handler) ProcessPacket(data []byte, remoteAddr *net.UDPAddr) (*PacketRe
 	case messageTransportType:
 		return h.processDataPacket(data)
 	default:
-		return nil, fmt.Errorf("unknown message type: %d", msgType)
+		return PacketResult{}, fmt.Errorf("unknown message type: %d", msgType)
 	}
 }
 

@@ -14,14 +14,14 @@ import (
 // processDataPacket decrypts an incoming type-4 transport data packet. It looks
 // up the keypair by receiver index, checks for replay, and decrypts the payload.
 // Empty payloads are returned as PacketKeepalive.
-func (h *Handler) processDataPacket(data []byte) (*PacketResult, error) {
+func (h *Handler) processDataPacket(data []byte) (PacketResult, error) {
 	if len(data) < messageTransportHeaderSize {
-		return nil, fmt.Errorf("data packet too short: %d", len(data))
+		return PacketResult{}, fmt.Errorf("data packet too short: %d", len(data))
 	}
 
 	msgType := binary_le_uint32(data[0:4])
 	if msgType != messageTransportType {
-		return nil, fmt.Errorf("invalid message type: %d (expected %d)", msgType, messageTransportType)
+		return PacketResult{}, fmt.Errorf("invalid message type: %d (expected %d)", msgType, messageTransportType)
 	}
 
 	receiverIdx := binary_le_uint32(data[4:8])
@@ -33,12 +33,12 @@ func (h *Handler) processDataPacket(data []byte) (*PacketResult, error) {
 	h.keypairsMutex.RUnlock()
 
 	if !exists {
-		return nil, fmt.Errorf("no keypair for receiver index: %d", receiverIdx)
+		return PacketResult{}, fmt.Errorf("no keypair for receiver index: %d", receiverIdx)
 	}
 
 	// Reject expired keypairs (forward secrecy)
 	if now().Sub(kp.created) > RejectAfterTime {
-		return nil, fmt.Errorf("keypair expired")
+		return PacketResult{}, fmt.Errorf("keypair expired")
 	}
 
 	// Create nonce from counter
@@ -47,14 +47,14 @@ func (h *Handler) processDataPacket(data []byte) (*PacketResult, error) {
 
 	// Check for replay
 	if kp.replayFilter.CheckReplay(counter) {
-		return nil, fmt.Errorf("replay detected for counter: %d", counter)
+		return PacketResult{}, fmt.Errorf("replay detected for counter: %d", counter)
 	}
 
 	// Decrypt in-place
 	ciphertext := data[16:]
 	plaintext, err := kp.receive.Open(ciphertext[:0], nonce[:], ciphertext, nil)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt failed: %w", err)
+		return PacketResult{}, fmt.Errorf("decrypt failed: %w", err)
 	}
 
 	// Peer key is stored directly on the keypair — O(1) lookup.
@@ -74,7 +74,7 @@ func (h *Handler) processDataPacket(data []byte) (*PacketResult, error) {
 		resultType = PacketKeepalive
 	}
 
-	return &PacketResult{
+	return PacketResult{
 		Type:    resultType,
 		Data:    plaintext,
 		PeerKey: peerKey,
@@ -97,19 +97,21 @@ func (h *Handler) encryptDataPacket(data []byte, peerKey NoisePublicKey) ([]byte
 	}
 	h.sessionsMutex.RUnlock()
 
-	// Get current keypair
+	// Get current keypair — single now() call for all time checks.
+	n := now()
 	sess.mutex.Lock()
 	kp := sess.keypairCurrent
 	if kp == nil {
 		sess.mutex.Unlock()
 		return nil, fmt.Errorf("no current keypair for peer")
 	}
-	if now().Sub(kp.created) > RejectAfterTime {
+	kpAge := n.Sub(kp.created)
+	if kpAge > RejectAfterTime {
 		sess.mutex.Unlock()
 		return nil, fmt.Errorf("keypair expired: initiate new handshake")
 	}
 	remoteIndex := kp.remoteIndex
-	sess.lastSent = now()
+	sess.lastSent = n
 	sess.mutex.Unlock()
 
 	// Increment per-keypair counter (starts at 0)
@@ -124,18 +126,22 @@ func (h *Handler) encryptDataPacket(data []byte, peerKey NoisePublicKey) ([]byte
 	var nonce [chacha20poly1305.NonceSize]byte
 	binary_le_put_uint64(nonce[4:], counter)
 
-	// Encrypt
-	ciphertext := kp.send.Seal(nil, nonce[:], data, nil)
+	// Allocate a single buffer for header + ciphertext. Seal directly into
+	// the buffer at offset 16 to avoid a separate ciphertext allocation.
+	ciphertextLen := len(data) + chacha20poly1305.Overhead
+	totalLen := messageTransportHeaderSize + ciphertextLen
+	result := make([]byte, totalLen)
 
-	// Build packet
-	result := make([]byte, messageTransportHeaderSize+len(ciphertext))
+	// Write header
 	binary_le_put_uint32(result[0:4], messageTransportType)
 	binary_le_put_uint32(result[4:8], remoteIndex)
 	binary_le_put_uint64(result[8:16], counter)
-	copy(result[messageTransportHeaderSize:], ciphertext)
+
+	// Seal into the result buffer directly (no intermediate alloc).
+	kp.send.Seal(result[messageTransportHeaderSize:messageTransportHeaderSize], nonce[:], data, nil)
 
 	// Signal rekey if approaching limits
-	if counter >= RekeyAfterMessages || now().Sub(kp.created) >= RekeyAfterTime {
+	if counter >= RekeyAfterMessages || kpAge >= RekeyAfterTime {
 		return result, ErrRekeyRequired
 	}
 
