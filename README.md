@@ -123,20 +123,55 @@ pktkit.Serve(ln, hub) // accept loop: each VM joins the hub
 
 All data-plane hot paths are zero-allocation. Benchmarks on an i9-14900K (32 threads):
 
+### Core
+
 | Path | ns/op | Throughput | Allocs |
 |------|------:|----------:|-------:|
-| Frame accessors | 0.68 | 2.2 TB/s | 0 |
-| Packet IPv4 accessors | 1.0 | 1.5 TB/s | 0 |
-| Packet IPv6 accessors | 0.59 | 2.5 TB/s | 0 |
-| L2Hub unicast forward | 57 | 26 GB/s | 0 |
-| L2Hub forward (parallel) | 3.2 | 472 GB/s | 0 |
-| L3Hub route | 10.7 | 140 GB/s | 0 |
-| L2Adapter incoming (frame to packet) | 38 | 40 GB/s | 0 |
-| L2Adapter outgoing (packet to frame, pooled) | 68 | 22 GB/s | 0 |
-| Checksum (1500 B) | 307 | 4.9 GB/s | 0 |
-| NAT outbound TCP (1440 B payload) | 292 | 4.9 GB/s | 1 |
-| SendBuf PeekUnsent | 0.28 | 5.3 TB/s | 0 |
-| ARP/NDP table lookup | 42 | - | 0 |
+| Frame accessors | 0.63 | 2.4 TB/s | 0 |
+| Packet IPv4 accessors | 0.92 | 1.6 TB/s | 0 |
+| Packet IPv6 accessors | 0.67 | 2.2 TB/s | 0 |
+| L2Hub unicast forward | 50 | 30 GB/s | 0 |
+| L2Hub forward (parallel) | 2.3 | 656 GB/s | 0 |
+| L3Hub route | 9.2 | 163 GB/s | 0 |
+| L2Adapter incoming (frame to packet) | 33 | 46 GB/s | 0 |
+| L2Adapter outgoing (packet to frame, pooled) | 61 | 24 GB/s | 0 |
+| Checksum (1500 B) | 273 | 5.5 GB/s | 0 |
+| SendBuf PeekUnsent | 0.24 | 6.1 TB/s | 0 |
+| ARP/NDP table lookup | 37 | - | 0 |
+
+### NAT (1440 B payload)
+
+| Path | ns/op | Throughput | Allocs |
+|------|------:|----------:|-------:|
+| NAT outbound TCP | 40 | 36 GB/s | 0 |
+| NAT inbound TCP | 41 | 35 GB/s | 0 |
+| NAT outbound UDP | 34 | 3.7 GB/s | 0 |
+| NAT mapping lookup | 12 | - | 0 |
+| Defrag (non-fragment fast path) | 1.4 | 1.0 TB/s | 0 |
+
+### WireGuard (1420 B payload)
+
+| Path | ns/op | Throughput | Allocs |
+|------|------:|----------:|-------:|
+| Encrypt (EncryptTo, zero-alloc) | 555 | 2.6 GB/s | 0 |
+| Encrypt + Decrypt (zero-alloc) | 1131 | 1.3 GB/s | 0 |
+| Encrypt (Encrypt, allocating) | 2417 | 588 MB/s | 1 |
+| Decrypt (ProcessPacket) | 4135 | 343 MB/s | 1 |
+| Handshake (full initiation + response) | 578k | - | 481 |
+| Key generation | 57 | - | 0 |
+| Replay filter | 9.1 | - | 0 |
+| Peer lookup | 13 | - | 0 |
+
+### OpenVPN GCM (1420 B payload)
+
+| Path | ns/op | Throughput | Allocs |
+|------|------:|----------:|-------:|
+| GCM encrypt | 227 | 6.3 GB/s | 1 |
+| GCM decrypt | 1941 | 732 MB/s | 1 |
+| CBC encrypt | 8112 | 175 MB/s | 15 |
+| Replay window | 9.2 | - | 0 |
+| PRF 1.2 (256 B) | 3497 | 73 MB/s | 25 |
+| Options parse | 721 | - | 4 |
 
 Run benchmarks with `go test -bench=. -benchmem ./...`.
 
