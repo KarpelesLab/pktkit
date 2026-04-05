@@ -1,6 +1,9 @@
 package pktkit
 
-import "sync"
+import (
+	"sync"
+	"unsafe"
+)
 
 // DefaultMTU is the default buffer size used by the packet pool.
 const DefaultMTU = 1536
@@ -32,4 +35,20 @@ func AllocBuffer(n int) ([]byte, *[]byte) {
 func FreeBuffer(bufp *[]byte) {
 	*bufp = (*bufp)[:cap(*bufp)]
 	pktPool.Put(bufp)
+}
+
+// Noescape hides a pointer from escape analysis. Use this to prevent
+// stack-allocated arrays (e.g. nonces, IVs) from escaping to the heap
+// when passed as slices to crypto interfaces.
+//
+//go:nosplit
+func Noescape(p unsafe.Pointer) unsafe.Pointer {
+	x := uintptr(p)
+	return unsafe.Pointer(x ^ 0 ^ 0)
+}
+
+// NoescapeBytes returns a []byte of length n pointing to p without causing
+// escape analysis to move *p to the heap.
+func NoescapeBytes(p unsafe.Pointer, n int) []byte {
+	return unsafe.Slice((*byte)(Noescape(p)), n)
 }

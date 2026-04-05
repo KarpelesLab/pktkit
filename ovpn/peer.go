@@ -14,6 +14,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/KarpelesLab/pktkit"
 )
@@ -134,27 +135,125 @@ func (p *Peer) handleData(data []byte) (err error) {
 		return errors.New("this stream is not ready for data transmission")
 	}
 
+	// Lazily initialize cipher block
+	if p.opts.CipherCrypto != 0 && p.opts.CipherBlockDecrypt == nil {
+		p.opts.CipherBlockDecrypt, err = aes.NewCipher(p.keys.CipherDecrypt[:(p.opts.CipherSize / 8)])
+		if err != nil {
+			return err
+		}
+	}
+
+	// Fast path for GCM (most common modern cipher)
+	if p.opts.CipherCrypto != 0 && p.opts.CipherBlock == GCM && p.opts.AuthHashSize == 0 {
+		return p.handleDataGCM(data)
+	}
+
+	return p.handleDataGeneric(data)
+}
+
+// handleDataGCM is the optimized GCM decrypt path with minimal allocations.
+// Wire format: [opcode:1][pid:4][tag:16][ciphertext...]
+func (p *Peer) handleDataGCM(data []byte) error {
+	// Minimum: opcode(1) + pid(4) + tag(16) = 21
+	if len(data) < 21 {
+		return errors.New("GCM packet too short")
+	}
+
+	if p.opts.DecryptAEAD == nil {
+		var err error
+		p.opts.DecryptAEAD, err = cipher.NewGCM(p.opts.CipherBlockDecrypt)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Parse PID from bytes 1-5
+	pid := binary.BigEndian.Uint32(data[1:5])
+
+	// Build nonce: [pid:4][implicit_iv from HmacDecrypt]
+	var nonce [12]byte
+	copy(nonce[0:4], data[1:5])
+	copy(nonce[4:], p.keys.HmacDecrypt[:p.opts.DecryptAEAD.NonceSize()-4])
+
+	// AD is the 4-byte PID
+	ad := data[1:5]
+
+	// OpenVPN wire format has tag before ciphertext: [tag:16][ct...]
+	// Go's GCM Open expects: [ct...][tag:16]
+	// Rearrange in-place.
+	payload := data[5:] // [tag:16][ct...]
+	ctLen := len(payload) - 16
+	if ctLen < 0 {
+		return errors.New("GCM payload too short")
+	}
+
+	// Swap tag to end: copy tag aside, shift ct left, put tag at end
+	var tag [16]byte
+	copy(tag[:], payload[0:16])
+	copy(payload[0:ctLen], payload[16:])
+	copy(payload[ctLen:], tag[:])
+
+	// Decrypt in-place
+	plaintext, err := p.opts.DecryptAEAD.Open(payload[:0], pktkit.NoescapeBytes(unsafe.Pointer(&nonce), 12), payload, ad)
+	if err != nil {
+		return nil // GCM auth failure — drop silently
+	}
+
+	// Replay protection
+	if !p.replayWindow.check(pid) {
+		return nil
+	}
+
+	// Parse compression byte
+	if len(plaintext) < 1 {
+		return nil
+	}
+	switch plaintext[0] {
+	case 0xfa: // no compression
+		plaintext = plaintext[1:]
+	case 0x66:
+		return errors.New("lzo compression not supported")
+	case 0x69:
+		return errors.New("lz4 compression not supported")
+	default:
+		return errors.New("unsupported compression format")
+	}
+
+	// Check for ping
+	if len(plaintext) == len(OPENVPN_PING) && bytes.Equal(OPENVPN_PING, plaintext) {
+		return nil
+	}
+
+	// Deliver decrypted payload
+	if p.layer == 2 {
+		if p.onL2Packet != nil {
+			p.onL2Packet(pktkit.Frame(plaintext))
+		}
+	} else if p.onL3Packet != nil {
+		p.onL3Packet(pktkit.Packet(plaintext))
+	}
+	return nil
+}
+
+// handleDataGeneric handles CBC and other non-GCM cipher modes (original path).
+func (p *Peer) handleDataGeneric(data []byte) (err error) {
 	buf := bytes.NewReader(data)
 	buf.ReadByte()
 
 	// check hmac
 	if p.opts.AuthHashSize != 0 {
-		// remove hash from beginning of packet
 		hash := make([]byte, p.opts.AuthHashSize)
 		_, err = io.ReadFull(buf, hash)
 		if err != nil {
 			return err
 		}
 
-		// compute hmac
 		h := hmac.New(p.opts.AuthHashNew, p.keys.HmacDecrypt[:p.opts.AuthHashSize])
-
 		pos, _ := buf.Seek(0, io.SeekCurrent)
 		buf.WriteTo(h)
 		buf.Seek(pos, io.SeekStart)
 
 		if !hmac.Equal(hash, h.Sum(nil)) {
-			log.Printf("[ovpn] invalid hmac in packet from %v - packet ignored", p)
 			return nil
 		}
 	}
@@ -162,18 +261,9 @@ func (p *Peer) handleData(data []byte) (err error) {
 	var pid uint32
 	pid_read_done := false
 
-	// handle encryption
 	if p.opts.CipherCrypto != 0 {
-		if p.opts.CipherBlockDecrypt == nil {
-			p.opts.CipherBlockDecrypt, err = aes.NewCipher(p.keys.CipherDecrypt[:(p.opts.CipherSize / 8)])
-			if err != nil {
-				return err
-			}
-		}
-
 		switch p.opts.CipherBlock {
 		case CBC:
-			// block size = 128 bits / 16 bytes, IV is prefixed to block
 			iv := make([]byte, 16)
 			_, err = io.ReadFull(buf, iv)
 			if err != nil {
@@ -187,7 +277,6 @@ func (p *Peer) handleData(data []byte) (err error) {
 			data = PKCS5Trimming(data)
 			buf = bytes.NewReader(data)
 		case GCM:
-			// we use a single instance of GCM over time
 			if p.opts.DecryptAEAD == nil {
 				p.opts.DecryptAEAD, err = cipher.NewGCM(p.opts.CipherBlockDecrypt)
 				if err != nil {
@@ -195,7 +284,6 @@ func (p *Peer) handleData(data []byte) (err error) {
 				}
 			}
 
-			// read explicit iv part
 			iv := make([]byte, 4)
 			_, err = io.ReadFull(buf, iv)
 			if err != nil {
@@ -208,27 +296,21 @@ func (p *Peer) handleData(data []byte) (err error) {
 			binary.Read(bytes.NewReader(data_ad), binary.BigEndian, &pid)
 			pid_read_done = true
 
-			// append to iv implicit data
 			iv = append(iv, p.keys.HmacDecrypt[:p.opts.DecryptAEAD.NonceSize()-len(iv)]...)
 
 			pos, _ := buf.Seek(0, io.SeekCurrent)
 			data = data[pos:]
 
-			// openvpn will put tag at beginning of string, but golang requires tag to be appended
 			tag := data[0:16]
 			data = append(data[16:], tag...)
 
-			// open
 			data, err = p.opts.DecryptAEAD.Open(data[:0], iv, data, data_ad)
 			if err != nil {
-				log.Printf("[ovpn] failed to read encrypted data: GCM error %v", err)
 				return nil
 			}
 
-			// reset reader
 			buf = bytes.NewReader(data)
 		default:
-			log.Printf("[ovpn] unsupported cipher block method %v, packet ignored", p.opts.CipherBlock)
 			return nil
 		}
 	}
@@ -240,44 +322,33 @@ func (p *Peer) handleData(data []byte) (err error) {
 		}
 	}
 
-	// replay protection
 	if !p.replayWindow.check(pid) {
-		return nil // duplicate or too old
+		return nil
 	}
 
 	compress, _ := buf.ReadByte()
 	switch compress {
-	case 0x66: // lzo
+	case 0x66:
 		return errors.New("lzo compression not supported")
-	case 0x69: // lz4
+	case 0x69:
 		return errors.New("lz4 compression not supported")
-	case 0xfa: // no compression
-		// nothing
+	case 0xfa:
 	default:
 		return errors.New("unsupported compression format")
 	}
 
 	pos, _ := buf.Seek(0, io.SeekCurrent)
-
-	// re-calculate data here
 	data = data[pos:]
 
-	if len(data) == len(OPENVPN_PING) {
-		if bytes.Equal(OPENVPN_PING, data) {
-			return nil
-		}
+	if len(data) == len(OPENVPN_PING) && bytes.Equal(OPENVPN_PING, data) {
+		return nil
 	}
 
-	// deliver decrypted payload
 	if p.layer == 2 {
 		if p.onL2Packet != nil {
 			p.onL2Packet(pktkit.Frame(data))
 		}
-		return nil
-	}
-
-	// layer 3 (tun mode)
-	if p.onL3Packet != nil {
+	} else if p.onL3Packet != nil {
 		p.onL3Packet(pktkit.Packet(data))
 	}
 	return nil
@@ -348,34 +419,112 @@ func (p *Peer) handleControlPacketLocked(pkt *ControlPacket) error {
 }
 
 func (p *Peer) SendData(data []byte) error {
-	// we need to make a P_DATA_V1 packet
-	// first we need a unique packet id
+	if p.opts == nil {
+		return errors.New("this stream is not ready for data transmission")
+	}
+
+	var err error
+
+	// Lazily initialize cipher block
+	if p.opts.CipherCrypto != 0 && p.opts.CipherBlockEncrypt == nil {
+		p.opts.CipherBlockEncrypt, err = aes.NewCipher(p.keys.CipherEncrypt[:(p.opts.CipherSize / 8)])
+		if err != nil {
+			return err
+		}
+	}
+
+	// Dispatch to optimized path per cipher mode
+	if p.opts.CipherCrypto != 0 && p.opts.CipherBlock == GCM {
+		return p.sendDataGCM(data)
+	}
+	return p.sendDataGeneric(data)
+}
+
+// sendDataGCM is the optimized GCM encrypt path with minimal allocations.
+// Wire format: [opcode:1][pid:4][tag:16][ciphertext...]
+// The plaintext is [compression:1][payload...], encrypted with nonce=[pid:4][implicit_iv:8].
+func (p *Peer) sendDataGCM(data []byte) error {
+	if p.opts.EncryptAEAD == nil {
+		var err error
+		p.opts.EncryptAEAD, err = cipher.NewGCM(p.opts.CipherBlockEncrypt)
+		if err != nil {
+			return err
+		}
+	}
+
+	aead := p.opts.EncryptAEAD
+
+	pid := atomic.AddUint32(&p.pid, 1)
+
+	// Build nonce: [pid:4][implicit_iv from HmacEncrypt]
+	var nonce [12]byte
+	binary.BigEndian.PutUint32(nonce[0:4], pid)
+	copy(nonce[4:], p.keys.HmacEncrypt[:aead.NonceSize()-4])
+
+	// AD is the 4-byte PID
+	var ad [4]byte
+	binary.BigEndian.PutUint32(ad[0:4], pid)
+
+	// Build plaintext: [compression_byte][payload]
+	hasCompression := p.opts.Compression != ""
+	ptLen := len(data)
+	if hasCompression {
+		ptLen++
+	}
+
+	// Output layout: [opcode:1][pid:4][tag:16][ciphertext(ptLen)...]
+	// Total = 1 + 4 + 16 + ptLen = 21 + ptLen
+	outLen := 1 + 4 + 16 + ptLen
+	out, handle := pktkit.AllocBuffer(outLen)
+
+	// Opcode
+	out[0] = byte(P_DATA_V1) << P_OPCODE_SHIFT
+
+	// PID
+	copy(out[1:5], ad[:])
+
+	// Assemble plaintext in a contiguous region so Seal can read it.
+	// We use the area after the tag in `out` as scratch for the plaintext,
+	// since Seal will overwrite it with ciphertext of the same length.
+	pt := out[21:21] // len=0, cap has room for ptLen
+	if hasCompression {
+		pt = append(pt, 0xfa)
+	}
+	pt = append(pt, data...)
+
+	// Seal into out[21:] (ciphertext), appending the tag at the end.
+	// Go's GCM Seal produces: ciphertext || tag
+	sealed := aead.Seal(out[21:21], pktkit.NoescapeBytes(unsafe.Pointer(&nonce), 12), pt, ad[:])
+
+	// OpenVPN wants tag BEFORE ciphertext. sealed = ciphertext || tag (in out[21:]).
+	// We need to rearrange to out[5:] = tag || ciphertext.
+	sealedLen := len(sealed) // = ptLen + 16
+	ctLen := sealedLen - 16
+
+	// Copy tag (last 16 bytes of sealed) to out[5:21]
+	copy(out[5:21], out[21+ctLen:21+sealedLen])
+	// Ciphertext is already at out[21:21+ctLen], which is correct position.
+
+	err := p.Send(out[:outLen])
+	pktkit.FreeBuffer(handle)
+	return err
+}
+
+// sendDataGeneric handles CBC and other non-GCM cipher modes (original path).
+func (p *Peer) sendDataGeneric(data []byte) error {
 	pid := atomic.AddUint32(&p.pid, 1)
 	pidBin := []byte{0, 0, 0, 0}
 	binary.BigEndian.PutUint32(pidBin, pid)
 
-	// data to prefix (can be compression info or packet id)
 	var pfx []byte
-
 	if p.opts.Compression != "" {
-		// need to prefix compression info
-		// 0xfa = no compression
 		pfx = append(pfx, 0xfa)
 	}
 	var err error
 
-	// handle encryption
 	if p.opts.CipherCrypto != 0 {
-		if p.opts.CipherBlockEncrypt == nil {
-			p.opts.CipherBlockEncrypt, err = aes.NewCipher(p.keys.CipherEncrypt[:(p.opts.CipherSize / 8)])
-			if err != nil {
-				return err
-			}
-		}
-
 		switch p.opts.CipherBlock {
 		case CBC:
-			// block size = 128 bits / 16 bytes, IV is prefixed to block
 			iv := make([]byte, 16)
 			_, err = io.ReadFull(rand.Reader, iv)
 			if err != nil {
@@ -389,59 +538,21 @@ func (p *Peer) SendData(data []byte) error {
 			}
 			data = PKCS5Padding(data, 16)
 			enc.CryptBlocks(data, data)
-
-			// prefix iv
 			data = append(iv, data...)
-		case GCM:
-			// we use a single instance of GCM over time
-			if p.opts.EncryptAEAD == nil {
-				p.opts.EncryptAEAD, err = cipher.NewGCM(p.opts.CipherBlockEncrypt)
-				if err != nil {
-					return err
-				}
-			}
-
-			// make explicit iv part
-			iv := make([]byte, 4)
-			copy(iv, pidBin)
-
-			// append to iv implicit data
-			iv = append(iv, p.keys.HmacEncrypt[:p.opts.EncryptAEAD.NonceSize()-len(iv)]...)
-
-			if pfx != nil {
-				data = append(pfx, data...)
-			}
-
-			// seal
-			data = p.opts.EncryptAEAD.Seal(data[:0], iv, data, pidBin)
-
-			// openvpn will want tag at beginning of string, but golang requires tag to be appended
-			tag := data[len(data)-16:]
-			data = append(tag, data[:len(data)-16]...)
-
-			// prefix pid
-			data = append(pidBin, data...)
 		default:
 			log.Printf("[ovpn] unsupported cipher block method %v, packet ignored", p.opts.CipherBlock)
 			return nil
 		}
 	}
 
-	// add packet type (kid=0)
 	id := byte(P_DATA_V1) << P_OPCODE_SHIFT
 
-	// add hmac
 	if p.opts.AuthHashSize != 0 {
-		// compute hmac
 		h := hmac.New(p.opts.AuthHashNew, p.keys.HmacEncrypt[:p.opts.AuthHashSize])
 		h.Write(data)
-
 		hash := h.Sum(nil)
-
-		// prepend
 		data = append(append([]byte{id}, hash[:p.opts.AuthHashSize]...), data...)
 	} else {
-		// only prepend packet code
 		data = append([]byte{id}, data...)
 	}
 

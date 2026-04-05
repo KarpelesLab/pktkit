@@ -14,20 +14,10 @@ import (
 	"github.com/KarpelesLab/pktkit"
 )
 
-// noescape hides a pointer from escape analysis. It is the identity function
-// but the compiler cannot see through it. This is used to prevent the nonce
-// array from escaping to the heap when passed to Seal/Open as a slice.
-//
-//go:nosplit
-func noescape(p unsafe.Pointer) unsafe.Pointer {
-	x := uintptr(p)
-	return unsafe.Pointer(x ^ 0 ^ 0)
-}
-
 // noescapeSlice returns a []byte pointing to the given array without causing
 // escape analysis to move the array to the heap.
 func noescapeSlice(b *[chacha20poly1305.NonceSize]byte) []byte {
-	return unsafe.Slice((*byte)(noescape(unsafe.Pointer(b))), chacha20poly1305.NonceSize)
+	return pktkit.NoescapeBytes(unsafe.Pointer(b), chacha20poly1305.NonceSize)
 }
 
 // processDataPacket decrypts an incoming type-4 transport data packet. It looks
