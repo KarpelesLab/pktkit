@@ -27,6 +27,10 @@ type DHCPServerConfig struct {
 	LeaseTime time.Duration
 	// MAC is the server's hardware address. Generated if nil.
 	MAC net.HardwareAddr
+	// StaticLeases reserves specific IPs for specific client MAC addresses.
+	// A reserved IP is always handed to its MAC and never allocated to any
+	// other client, even if it falls within RangeStart..RangeEnd.
+	StaticLeases map[[6]byte]netip.Addr
 }
 
 type dhcpLease struct {
@@ -186,18 +190,31 @@ func (s *DHCPServer) allocate(mac [6]byte) netip.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
+
+	// Static reservation for this MAC always wins.
+	if ip, ok := s.cfg.StaticLeases[mac]; ok && ip.IsValid() {
+		s.leases[mac] = &dhcpLease{ip: ip, mac: mac, expiry: now.Add(s.cfg.LeaseTime)}
+		return ip
+	}
+
 	// Existing lease?
 	if l, ok := s.leases[mac]; ok {
-		l.expiry = time.Now().Add(s.cfg.LeaseTime)
+		l.expiry = now.Add(s.cfg.LeaseTime)
 		return l.ip
 	}
 
 	// Find a free IP in the range
-	now := time.Now()
 	assigned := make(map[netip.Addr]bool)
 	for _, l := range s.leases {
 		if now.Before(l.expiry) {
 			assigned[l.ip] = true
+		}
+	}
+	// IPs reserved for other MACs are never available here.
+	for m, ip := range s.cfg.StaticLeases {
+		if m != mac && ip.IsValid() {
+			assigned[ip] = true
 		}
 	}
 
@@ -225,6 +242,17 @@ func (s *DHCPServer) confirm(mac [6]byte, requested netip.Addr) netip.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
+
+	// Static reservation: only the reserved IP is acceptable for this MAC.
+	if staticIP, ok := s.cfg.StaticLeases[mac]; ok && staticIP.IsValid() {
+		if requested.IsValid() && requested != staticIP {
+			return netip.Addr{} // client wants a different IP than its reservation
+		}
+		s.leases[mac] = &dhcpLease{ip: staticIP, mac: mac, expiry: now.Add(s.cfg.LeaseTime)}
+		return staticIP
+	}
+
 	l, ok := s.leases[mac]
 	if !ok {
 		// No existing lease — try to grant the requested IP if it's valid and in range.
@@ -240,8 +268,13 @@ func (s *DHCPServer) confirm(mac [6]byte, requested netip.Addr) netip.Addr {
 		if requested.Compare(s.cfg.RangeStart) < 0 || requested.Compare(s.cfg.RangeEnd) > 0 {
 			return netip.Addr{} // outside the configured pool
 		}
+		// Reserved for another MAC?
+		for m, rip := range s.cfg.StaticLeases {
+			if m != mac && rip == requested {
+				return netip.Addr{}
+			}
+		}
 		// Check for conflicts with existing leases.
-		now := time.Now()
 		for _, other := range s.leases {
 			if other.ip == requested && now.Before(other.expiry) {
 				return netip.Addr{} // already leased to another client
@@ -256,7 +289,7 @@ func (s *DHCPServer) confirm(mac [6]byte, requested netip.Addr) netip.Addr {
 	if requested.IsValid() && requested != l.ip {
 		return netip.Addr{} // mismatch
 	}
-	l.expiry = time.Now().Add(s.cfg.LeaseTime)
+	l.expiry = now.Add(s.cfg.LeaseTime)
 	return l.ip
 }
 

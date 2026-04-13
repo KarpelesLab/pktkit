@@ -113,3 +113,67 @@ func TestDHCPServerIntegration(t *testing.T) {
 	}
 	t.Logf("first 200 bytes: %s", string(body[:min(200, len(body))]))
 }
+
+// TestDHCPServerStaticLeases verifies that MACs with a static reservation
+// always get their reserved IP, and that the reserved IP is never handed to
+// a different MAC — even if the pool would otherwise cover it.
+func TestDHCPServerStaticLeases(t *testing.T) {
+	reservedMAC := net.HardwareAddr{0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x01}
+	otherMAC := net.HardwareAddr{0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x02}
+	reservedIP := netip.MustParseAddr("192.168.77.20")
+
+	hub := pktkit.NewL2Hub()
+
+	dhcpSrv := pktkit.NewDHCPServer(pktkit.DHCPServerConfig{
+		ServerIP:   netip.MustParseAddr("192.168.77.1"),
+		SubnetMask: net.CIDRMask(24, 32),
+		// Pool overlaps with the reserved IP on purpose: the server
+		// must still keep 192.168.77.20 off the dynamic allocation path.
+		RangeStart: netip.MustParseAddr("192.168.77.10"),
+		RangeEnd:   netip.MustParseAddr("192.168.77.30"),
+		Router:     netip.MustParseAddr("192.168.77.1"),
+		LeaseTime:  5 * time.Minute,
+		StaticLeases: map[[6]byte]netip.Addr{
+			{0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x01}: reservedIP,
+		},
+	})
+	hub.Connect(dhcpSrv)
+
+	run := func(mac net.HardwareAddr) netip.Prefix {
+		client := vclient.New()
+		defer client.Close()
+		adapter := pktkit.NewL2Adapter(client, mac)
+		defer adapter.Close()
+		hub.Connect(adapter)
+		adapter.StartDHCP()
+
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			addr := client.Addr()
+			if addr.IsValid() && addr.Addr().IsPrivate() {
+				return addr
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return netip.Prefix{}
+	}
+
+	reservedAddr := run(reservedMAC)
+	if !reservedAddr.IsValid() {
+		t.Fatal("reserved MAC never got an IP")
+	}
+	if reservedAddr.Addr() != reservedIP {
+		t.Errorf("reserved MAC got %s, want %s", reservedAddr.Addr(), reservedIP)
+	}
+
+	otherAddr := run(otherMAC)
+	if !otherAddr.IsValid() {
+		t.Fatal("other MAC never got an IP")
+	}
+	if otherAddr.Addr() == reservedIP {
+		t.Errorf("other MAC was handed the reserved IP %s", reservedIP)
+	}
+	if !otherAddr.Addr().IsPrivate() {
+		t.Errorf("other MAC got non-private IP %s", otherAddr.Addr())
+	}
+}
